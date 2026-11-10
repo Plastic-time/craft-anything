@@ -1548,7 +1548,7 @@ Owner: open · Status: in progress
 
 ### R3.12 Format parser correctness
 Owner: open · Status: in progress
-- [ ] Reject contradictory DOS executable size declarations.
+- [x] Reject contradictory DOS executable size declarations.
       — claimed: Plastic-time, branch rrfz/bugfix-r3.12-mz-header-20261110
 - [x] Refuse oversized GNU tar long names and link targets instead of silently truncating member identities.
       — claimed: Afloat16, branch bugfix/r3.12-tar-long-identities-20261109

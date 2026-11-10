@@ -69,6 +69,9 @@ pub fn parse_mz(data: &[u8]) -> Result<MzImage, FormatError> {
         let full = u32::from(pages) * 512;
         if last_page == 0 { full } else { full - 512 + u32::from(last_page.min(512)) }
     };
+    if pages == 0 || last_page > 512 || header_bytes < 28 || header_bytes > image_size {
+        return Err(FormatError::Malformed("inconsistent MZ page count, last page size or header size".into()));
+    }
     let mut problems = Vec::new();
     let file_len = data.len() as u64;
     if u64::from(image_size) > file_len {
@@ -154,6 +157,18 @@ pub fn com_binary(data: &[u8]) -> Result<Binary, FormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_mz_size_declarations_are_rejected() {
+        let base = craft_anything_testkit::dos_mz();
+        for (offset, value) in [(2, 513u16), (4, 0), (8, 1), (8, 100)] {
+            let mut data = base.clone();
+            data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+            assert!(matches!(parse_mz(&data), Err(FormatError::Malformed(_))), "offset {offset}, value {value}");
+            assert!(crate::parse_binary(&data).is_err());
+        }
+        assert!(parse_mz(&base).is_ok());
+    }
 
     #[test]
     fn mz_header_and_relocations() {
