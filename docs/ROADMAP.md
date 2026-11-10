@@ -750,7 +750,7 @@ Owner: maintainers · Status: in progress
 
 ### R2.2 More coding agents
 Owner: open · Status: in progress
-- [ ] Insert a missing YAML server table before an explicit document end marker.
+- [x] Insert a missing YAML server table before an explicit document end marker.
       — claimed: Plastic-time, branch rrfz/bugfix-r2.2-yaml-document-end
 - [x] Find Codex bundled with ChatGPT.app/Codex.app after a macOS Dock launch, and
       verify the selected CLI's sign-in through the headless connection check and Settings.
