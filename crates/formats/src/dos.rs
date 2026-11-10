@@ -69,10 +69,19 @@ pub fn parse_mz(data: &[u8]) -> Result<MzImage, FormatError> {
         let full = u32::from(pages) * 512;
         if last_page == 0 { full } else { full - 512 + u32::from(last_page.min(512)) }
     };
-    if pages == 0 || last_page > 512 || header_bytes < 28 || header_bytes > image_size {
-        return Err(FormatError::Malformed("inconsistent MZ page count, last page size or header size".into()));
-    }
     let mut problems = Vec::new();
+    if pages == 0 {
+        problems.push("the header declares zero 512-byte pages".to_string());
+    }
+    if last_page > 512 {
+        problems.push(format!("the last page declares {last_page} bytes, more than 512"));
+    }
+    if header_bytes < 28 {
+        problems.push(format!("the {header_bytes}-byte header is shorter than the 28-byte MZ header"));
+    }
+    if pages != 0 && header_bytes > image_size {
+        problems.push(format!("the {header_bytes}-byte header is larger than the {image_size}-byte image"));
+    }
     let file_len = data.len() as u64;
     if u64::from(image_size) > file_len {
         problems.push(format!("the header declares {image_size} bytes but the file has {file_len}"));
@@ -158,16 +167,34 @@ pub fn com_binary(data: &[u8]) -> Result<Binary, FormatError> {
 mod tests {
     use super::*;
 
+    /// Contradictory size fields are reported as problems while the rest of the header still reads.
     #[test]
-    fn invalid_mz_size_declarations_are_rejected() {
+    fn contradictory_mz_size_declarations_are_reported() {
         let base = craft_anything_testkit::dos_mz();
-        for (offset, value) in [(2, 513u16), (4, 0), (8, 1), (8, 100)] {
+        let cases = [
+            (2, 513u16, "the last page declares 513 bytes, more than 512"),
+            (4, 0, "the header declares zero 512-byte pages"),
+            (8, 1, "the 16-byte header is shorter than the 28-byte MZ header"),
+            (8, 100, "the 1600-byte header is larger than the 79-byte image"),
+        ];
+        for (offset, value, problem) in cases {
             let mut data = base.clone();
             data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-            assert!(matches!(parse_mz(&data), Err(FormatError::Malformed(_))), "offset {offset}, value {value}");
-            assert!(crate::parse_binary(&data).is_err());
+            let image = parse_mz(&data).unwrap();
+            assert!(image.problems.iter().any(|p| p == problem), "offset {offset}, value {value}: {:?}", image.problems);
+            let binary = crate::parse_binary(&data).unwrap();
+            assert_eq!(binary.format, Format::DosMz);
+            assert!(binary.warnings.iter().any(|w| w == problem));
         }
-        assert!(parse_mz(&base).is_ok());
+        let last_page = {
+            let mut data = base.clone();
+            data[2..4].copy_from_slice(&513u16.to_le_bytes());
+            parse_mz(&data).unwrap()
+        };
+        assert_eq!((last_page.entry_cs, last_page.entry_ip), (0, 0));
+        assert_eq!(last_page.relocations.len(), 2);
+        assert_eq!(last_page.load_module_size, 15);
+        assert!(parse_mz(&base).unwrap().problems.is_empty());
         for last_page in [0u16, 512] {
             let mut full_page = base.clone();
             full_page.resize(512, 0);
@@ -178,6 +205,9 @@ mod tests {
         }
         let truncated = parse_mz(&base[..base.len() - 1]).unwrap();
         assert!(!truncated.problems.is_empty());
+        assert_eq!(truncated.load_module_offset, 64);
+        assert_eq!(truncated.load_module_size, 14);
+        assert_eq!(truncated.relocations.len(), 2);
     }
 
     #[test]
