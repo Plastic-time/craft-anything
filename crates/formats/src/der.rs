@@ -315,6 +315,9 @@ pub struct CertParts<'a> {
     pub tbs: &'a [u8],
     /// The `signatureAlgorithm` OID (dotted).
     pub signature_algorithm: String,
+    /// The outer and signed AlgorithmIdentifier values, including their parameters.
+    pub signature_algorithm_der: &'a [u8],
+    pub signed_signature_algorithm_der: &'a [u8],
     /// The `signatureValue` BIT STRING contents (leading unused-bits byte stripped).
     pub signature: &'a [u8],
     /// The `subjectPublicKeyInfo` SEQUENCE (header included).
@@ -359,12 +362,68 @@ pub fn certificate_parts(data: &[u8]) -> Option<CertParts<'_>> {
     let issuer = f.get(i + 2).filter(|t| t.tag == 0x30).and_then(|t| t.whole(data))?;
     let subject = f.get(i + 4).filter(|t| t.tag == 0x30).and_then(|t| t.whole(data))?;
     let spki = f.get(i + 5).filter(|t| t.tag == 0x30).and_then(|t| t.whole(data))?;
-    Some(CertParts { tbs, signature_algorithm, signature, spki, issuer, subject, serial })
+    let signature_algorithm_der = sig_alg_seq.whole(data)?;
+    let signed_signature_algorithm_der = f.get(i + 1)?.whole(data)?;
+    Some(CertParts { tbs, signature_algorithm, signature_algorithm_der, signed_signature_algorithm_der, signature, spki, issuer, subject, serial })
 }
 
 /// The `subjectPublicKeyInfo` SEQUENCE of a certificate (header included).
 pub fn certificate_spki(data: &[u8]) -> Option<&[u8]> {
     certificate_parts(data).map(|p| p.spki)
+}
+
+/// The subject key identifier extension's OCTET STRING, when one complete extension supplies it.
+pub fn certificate_subject_key_identifier(data: &[u8]) -> Option<&[u8]> {
+    let tbs = certificate_parts(data)?.tbs;
+    let fields = children(tbs, &read(tbs, 0)?);
+    if fields.last().is_none_or(|last| last.end() != tbs.len()) {
+        return None;
+    }
+    let mut wrappers = fields.iter().filter(|field| field.tag == 0xa3);
+    let wrapper = wrappers.next()?;
+    if wrappers.next().is_some() {
+        return None;
+    }
+    let sequence = read(tbs, wrapper.content)?;
+    if sequence.tag != 0x30 || sequence.end() != wrapper.end() {
+        return None;
+    }
+    let extensions = children(tbs, &sequence);
+    if extensions.last().is_none_or(|last| last.end() != sequence.end()) {
+        return None;
+    }
+    let mut key_id = None;
+    for extension in extensions {
+        if extension.tag != 0x30 {
+            return None;
+        }
+        let fields = children(tbs, &extension);
+        let Some(id) = fields.first().filter(|field| field.tag == 0x06).and_then(|field| field.bytes(tbs)) else { continue };
+        if oid(id) != "2.5.29.14" {
+            continue;
+        }
+        if key_id.is_some() || fields.last().is_none_or(|last| last.end() != extension.end()) {
+            return None;
+        }
+        let value_index = if let Some(critical) = fields.get(1).filter(|field| field.tag == 0x01) {
+            if !matches!(critical.bytes(tbs)?, [0] | [0xff]) {
+                return None;
+            }
+            2
+        } else {
+            1
+        };
+        if fields.len() != value_index + 1 {
+            return None;
+        }
+        let encoded = fields.get(value_index).filter(|field| field.tag == 0x04)?.bytes(tbs)?;
+        let value = read(encoded, 0)?;
+        if value.tag != 0x04 || value.end() != encoded.len() {
+            return None;
+        }
+        key_id = Some(value.bytes(encoded)?);
+    }
+    key_id
 }
 
 /// Split a `subjectPublicKeyInfo` into `(algorithm OID, public-key BIT STRING contents)`.
