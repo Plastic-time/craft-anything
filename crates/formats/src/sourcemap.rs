@@ -354,6 +354,7 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// Covers the reported input and the neighboring valid boundary.
     #[test]
     fn annotation_url_suffixes_survive() {
         for prefix in ["//# sourceMappingURL=", "//@ sourceMappingURL="] {
