@@ -320,6 +320,7 @@ mod stream_regressions {
     use super::*;
     use serde_json::json;
 
+    /// Editing and removal reject a stream whose extra documents would be ignored by the reader.
     #[test]
     fn multiple_yaml_documents_are_refused_before_editing() {
         for text in
