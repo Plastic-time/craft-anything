@@ -2050,7 +2050,7 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-cramfs-uncompressed-blocks-20261110
 - [x] Use ordered visited-node membership in ROMFS, ext, SquashFS and JFFS2 directory walks so wide filesystem trees avoid repeated scans of every previously visited node.
       — claimed: Afloat16, branch bugfix/r3.12-filesystem-page-visits-20261110
-- [ ] Read ROMFS names at the configured name-length limit.
+- [x] Read ROMFS names at the configured name-length limit.
       — claimed: Plastic-time, branch rrfz/bugfix-r3.12-romfs-name-20261110
 - [x] Read big-endian cramfs inode fields and block pointers so files and links recover like little-endian images.
       — claimed: Afloat16, branch bugfix/r3.12-cramfs-big-endian-20261110
