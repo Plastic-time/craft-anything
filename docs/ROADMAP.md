@@ -1891,7 +1891,7 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-wasm-debug-names
 - [x] Decode the full signed 32-bit source map VLQ range and refuse mapping fields outside it.
       — claimed: Afloat16, branch bugfix/r3.12-sourcemap-vlq-range
-- [ ] Reject source map mappings with missing source or name entries.
+- [x] Reject source map mappings with missing source or name entries.
       — claimed: Plastic-time, branch rrfz/bugfix-r3.12-mapping-index-20261110
 - [x] Group Go functions by the declaring package when a generic argument names another import path.
       — claimed: Afloat16, branch bugfix/r3.12-go-generic-owner
