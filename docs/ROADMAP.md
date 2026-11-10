@@ -1030,6 +1030,8 @@ Owner: open · Status: in progress
       — claimed: gtxy27, branch `bugfix/r2.2-dsh-stdin`
 - [ ] DeepSeek Harness: no resume (its headless profile keeps no session), and a build on the harness's
       desktop profile is untried
+- [ ] Apply repeated client selections and aliases once, preserving their first selection order.
+      — claimed: Plastic-time, branch rrfz/bugfix-r2.2-deduplicate-clients
 - [ ] `setup` writes the plain `mcp` command, so it drops an `--all-tools` an entry already has, and
       `doctor` then calls that entry "a different copy or shape of the command" and suggests the very
       command that breaks it. The installed skill now warns against running `setup` on such an entry;
