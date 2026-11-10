@@ -168,6 +168,16 @@ mod tests {
             assert!(crate::parse_binary(&data).is_err());
         }
         assert!(parse_mz(&base).is_ok());
+        for last_page in [0u16, 512] {
+            let mut full_page = base.clone();
+            full_page.resize(512, 0);
+            full_page[2..4].copy_from_slice(&last_page.to_le_bytes());
+            let image = parse_mz(&full_page).unwrap();
+            assert_eq!(image.load_module_size, 448);
+            assert!(image.problems.is_empty());
+        }
+        let truncated = parse_mz(&base[..base.len() - 1]).unwrap();
+        assert!(!truncated.problems.is_empty());
     }
 
     #[test]
