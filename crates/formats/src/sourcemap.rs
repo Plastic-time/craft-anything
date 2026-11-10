@@ -255,6 +255,7 @@ fn vlq(bytes: &[u8], pos: &mut usize) -> Option<i64> {
     })
 }
 
+/// Decode mapping deltas, rejecting fields that cannot name a declared source or symbol.
 fn decode_mappings(m: &str, map: &mut SourceMap, budget: &mut usize, line_budget: &mut usize, line_limit: usize) -> Result<(), SourceMapError> {
     let bytes = m.as_bytes();
     let (mut src, mut ol, mut oc, mut name) = (0i64, 0i64, 0i64, 0i64);
@@ -370,6 +371,7 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// Mappings reject undeclared indices while retaining null source slots.
     #[test]
     fn mapping_indices_must_refer_to_declared_entries() {
         for mappings in ["ACAA", "AAAAC"] {
