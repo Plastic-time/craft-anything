@@ -2089,6 +2089,8 @@ Owner: open · Status: in progress
       — claimed: Chr0mium24, branch bugfix/r3.12-swift-demangle-witness-accessors
 - [x] Apply the extracted-string limit in file-offset order across UTF-16LE and narrow strings, so an early wide string is not hidden by later ASCII.
       — claimed: Afloat16, branch bugfix/r3.12-earliest-extracted-strings
+- [ ] Keep quoted greater-than signs inside XML plist attributes instead of ending the tag early.
+      — claimed: Plastic-time, branch bugfix/r3.12-plist-quoted-tag-delimiters-1112
 - [x] Visit XML plist values only inside a complete, correctly encoded document.
       — claimed: Afloat16, branch bugfix/r3.12-xml-plist-document
 - [x] Normalize literal XML line endings before decoding plist text, keeping character references intact.
