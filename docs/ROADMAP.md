@@ -1561,6 +1561,12 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.11-value-flow-budget-20261110
 - [x] Resolve AArch64 address evidence only from known operands, with the right arithmetic width and retained writeback effects.
       — claimed: Afloat16, branch bugfix/r3.11-a64-address-proofs-20261110
+- [x] AArch64 shifted and extended register operands lose their shift: `sub w9, w9, w9, lsl #3` lifts
+      to `w9 -= w9;` and `add w9, w10, w9, lsr #31` to `w9 = w10 + w9;`. Keep the shift or extension
+      on the operand and show it in pseudo-C
+      — claimed: htcom-code, branch bugfix/r3.11-a64-shifted-operands
+- [ ] AArch64 memory operands with an extended index (`ldr w0, [x1, w2, sxtw #2]`) drop the extension:
+      the index reads as the plain register, so a sign-extended index looks unsigned in pseudo-C
 - [x] Preserve AArch64 exclusive-memory status results and paired load definitions without presenting them as unconditional stores.
       — claimed: Afloat16, branch bugfix/r3.11-a64-exclusive-value-flow-20261110
 - [x] Keep the first 100000 byte-search matches in file-offset order across hex, UTF-8 and UTF-16LE queries, including capped pages.
@@ -1617,6 +1623,12 @@ Owner: open · Status: in progress
       — claimed: muraa-p, branch bugfix/r3.11-publisher-hash-sections
 - [x] Preserve source registers and link-register writes for AArch64 returns and authenticated control transfers.
       — claimed: Afloat16, branch bugfix/r3.11-a64-control-registers-20261110
+- [x] AArch64 move-wide immediates lose their value: `movk w9, #0x9249, lsl #16` lifts to
+      `w9 = 0x92490000;`, dropping the low half set just before, and `mov w0, #-1` (MOVN) to
+      `w0 = 0;`. Keep MOVK's other bits and invert MOVN's immediate
+      — claimed: htcom-code, branch bugfix/r3.11-a64-move-wide-immediates
+- [ ] Fold an AArch64 MOVZ/MOVK sequence into one constant in pseudo-C: `mov w9, #0x2493` then
+      `movk w9, #0x9249, lsl #16` reads as two statements, not `w9 = 0x92492493;`
 - [x] Enforce stand-in per-body and total byte budgets on the text that is actually retained after redaction;
       deduplicate consecutive samples before charging the capture budget.
       — claimed: Afloat16, branch bugfix/r3.11-standin-redacted-budget-20261103b
@@ -1646,6 +1658,9 @@ Owner: open · Status: in progress
       target's kind stays `unknown`, so `core_targets_list` and triage's `description` say so, and
       Codex tried `core_overview_show` on a `.md` before triage. Give text its own target kind (or
       description) so the list and the app call it text — claimed: Martin-Aziz, branch bugfix/r3.11-text-target-kind
+- [x] AArch64 register and bitmask-immediate moves read their zero register: `mov x19, x0` (ORR from
+      `xzr`) lifts to `x19 = xzr;` and `mov w0, #0xff00ff00` to `w0 = wzr;`. Move the last operand
+      — claimed: htcom-code, branch bugfix/r3.11-a64-mov-alias-source
 
 ### R3.12 Format parser correctness
 Owner: open · Status: in progress
@@ -2356,6 +2371,8 @@ Owner: open · Status: in progress
       is plain JSON (Claude Code's, Claude Desktop's) stays plain JSON after an uninstall; an
       object written with trailing commas keeps them, new members included.
       — claimed: Plastic-time, branch bugfix/r3.12-jsonc-no-new-trailing-comma
+- [x] Preserve CRLF when creating the first JSONC object in a whitespace-only or comment-only file.
+      — claimed: Plastic-time, branch bugfix/r3.12-jsonc-first-object-eol-1111
 - [x] SQLite rows keep each value on its own column when a table has VIRTUAL generated columns:
       SQLite computes those when a row is read and stores no field for them, so they show as not
       read (with a note) instead of shifting later values onto the wrong columns, in rowid and
