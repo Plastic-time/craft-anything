@@ -1887,7 +1887,7 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-iostore-complete-header-20261105
 - [x] Reject CBOR collections that exceed the EVM metadata reader's limits and invalid text strings.
       — claimed: Afloat16, branch bugfix/r3.12-evm-cbor
-- [ ] Keep ordinary EVM metadata arrays as arrays, formatting three-part versions only for the Vyper version field.
+- [x] Keep ordinary EVM metadata arrays as arrays, formatting three-part versions only for compiler version fields.
       — claimed: Plastic-time, branch bugfix/r3.12-evm-metadata-array-values-1111
 - [x] Keep EVM bytecode intact when its CBOR trailer repeats a metadata key or uses a non-text map key.
       — claimed: Afloat16, branch bugfix/r3.12-evm-cbor-map-keys-20261110
