@@ -2196,6 +2196,8 @@ Owner: open · Status: in progress
       — claimed: NicolasBohn, branch bugfix/r3.12-sources-of-bad-mappings
 - [ ] An index-map section that points at an external map (`url`) adds no sources, so an application graph still
       treats the map's list as complete: mark those sources uncertain until the external map is read.
+- [ ] Recognize source-map annotations with no space, tabs or repeated spaces after the marker, and reject whitespace inside their URLs.
+      — claimed: Plastic-time, branch bugfix/r3.12-sourcemap-annotation-spacing-1111
 - [x] Keep source map annotation URL suffixes intact.
       — claimed: Plastic-time, branch rrfz/bugfix-r3.12-annotation-20261110
 - [x] Keep DOS relocations inside the declared executable header.
