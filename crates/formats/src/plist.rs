@@ -730,6 +730,9 @@ pub fn parse_xml(data: &[u8]) -> Result<Value, FormatError> {
             .map_err(|_| FormatError::Malformed("invalid UTF-8 in XML plist".into()))?
             .to_owned(),
     };
+    // XML normalizes literal line endings before parsing; character references such as
+    // &#13; must still decode to a carriage return afterwards.
+    let text = if text.contains('\r') { text.replace("\r\n", "\n").replace('\r', "\n") } else { text };
     let toks = tokenize(&text)?;
     let mut x = Xml { toks, pos: 0, nodes: 0 };
     x.skip_space();

@@ -1643,8 +1643,6 @@ Owner: open · Status: in progress
       description) so the list and the app call it text — claimed: Martin-Aziz, branch bugfix/r3.11-text-target-kind
 
 ### R3.12 Format parser correctness
-- [ ] Normalize literal XML line endings before decoding plist text, keeping character references intact.
-      — claimed: Plastic-time, branch bugfix/r3.12-plist-xml-line-endings-1111
 Owner: open · Status: in progress
 - [x] Keep source-to-bundle comparisons uncertain when source-map inventories are truncated, preserving positive matches and reporting partial tool evidence.
       — claimed: Afloat16, branch bugfix/r3.12-source-map-comparison-uncertainty-20261111
@@ -2069,6 +2067,8 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-earliest-extracted-strings
 - [x] Visit XML plist values only inside a complete, correctly encoded document.
       — claimed: Afloat16, branch bugfix/r3.12-xml-plist-document
+- [x] Normalize literal XML line endings before decoding plist text, keeping character references intact.
+      — claimed: Plastic-time, branch bugfix/r3.12-plist-xml-line-endings-1111
 - [x] End JavaScript line comments at every language line terminator, preserving following tokens for the nesting admission guard and lexer fallback.
       — claimed: Afloat16, branch bugfix/r3.12-js-line-comment-boundaries
 - [x] Read and edit JSONC registrations whose line comments end at a bare carriage return.
