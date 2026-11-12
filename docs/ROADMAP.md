@@ -1694,7 +1694,7 @@ Owner: open · Status: in progress
 - [x] Bound retained expanded PYZ paths across nested archives before allocating repeated prefixes;
       preserve complete entry identities and declared module counts in partial listings.
       — claimed: Afloat16, branch bugfix/r3.12-pyz-expanded-path-budget-20261110
-- [ ] Stop a PyInstaller CArchive listing at a member name without its required NUL terminator, preserving earlier readable members.
+- [x] Stop a PyInstaller CArchive listing at a member name without its required NUL terminator, preserving earlier readable members.
       — claimed: Plastic-time, branch bugfix/r3.12-pyinstaller-name-terminator-1111
 - [x] Keep PyInstaller CArchive member reads before the table and cookie, including signed files with trailing bytes.
       — claimed: Afloat16, branch bugfix/r3.12-carchive-payload-range-20261109
