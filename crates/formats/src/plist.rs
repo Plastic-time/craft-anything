@@ -564,7 +564,21 @@ fn tokenize(text: &str) -> Result<Vec<Tok>, FormatError> {
             rest = after_declaration(declaration)?;
             continue;
         }
-        let e = rest.find('>').ok_or_else(|| FormatError::Truncated("tag".into()))?;
+        let mut quote = None;
+        let e = rest
+            .find(|ch| match (quote, ch) {
+                (Some(q), c) if q == c => {
+                    quote = None;
+                    false
+                }
+                (None, '\'' | '"') => {
+                    quote = Some(ch);
+                    false
+                }
+                (None, '>') => true,
+                _ => false,
+            })
+            .ok_or_else(|| FormatError::Truncated("tag".into()))?;
         let inner = rest.get(1..e).unwrap_or("").trim();
         rest = rest.get(e + 1..).unwrap_or("");
         if let Some(name) = inner.strip_prefix('/') {
