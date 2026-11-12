@@ -790,10 +790,10 @@ fn past_sources(m: &str, sources: usize) -> Option<usize> {
 pub fn find_source_mapping_url(js: &str) -> Option<String> {
     for line in js.lines().rev().take(64) {
         let t = line.trim();
-        for prefix in ["//# sourceMappingURL=", "//@ sourceMappingURL=", "/*# sourceMappingURL="] {
-            if let Some(rest) = t.strip_prefix(prefix) {
+        for prefix in ["//#", "//@", "/*#"] {
+            if let Some(rest) = t.strip_prefix(prefix).and_then(|comment| comment.trim_start().strip_prefix("sourceMappingURL=")) {
                 let url = if prefix.starts_with("/*") { rest.strip_suffix("*/").unwrap_or(rest).trim() } else { rest.trim() };
-                if !url.is_empty() {
+                if !url.is_empty() && !url.chars().any(char::is_whitespace) {
                     return Some(url.to_string());
                 }
             }
