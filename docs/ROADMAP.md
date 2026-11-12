@@ -2347,7 +2347,7 @@ Owner: open · Status: in progress
       is plain JSON (Claude Code's, Claude Desktop's) stays plain JSON after an uninstall; an
       object written with trailing commas keeps them, new members included.
       — claimed: Plastic-time, branch bugfix/r3.12-jsonc-no-new-trailing-comma
-- [ ] Preserve CRLF when creating the first JSONC object in a whitespace-only or comment-only file.
+- [x] Preserve CRLF when creating the first JSONC object in a whitespace-only or comment-only file.
       — claimed: Plastic-time, branch bugfix/r3.12-jsonc-first-object-eol-1111
 - [x] SQLite rows keep each value on its own column when a table has VIRTUAL generated columns:
       SQLite computes those when a row is read and stores no field for them, so they show as not
