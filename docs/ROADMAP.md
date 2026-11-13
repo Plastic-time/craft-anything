@@ -2230,7 +2230,7 @@ Owner: open · Status: in progress
 - [x] Keep ELF version definitions, requirements and indices within their declared section byte ranges.
       — claimed: Afloat16, branch bugfix/r3.12-elf-version-section-bounds-20261109
 - [x] Keep PE optional-header reads within the declared header.
-- [ ] `pe_is_managed` reads data-directory 14 at a fixed offset without checking the declared
+- [x] `pe_is_managed` reads data-directory 14 at a fixed offset without checking the declared
       optional-header size, so a PE whose header ends before that directory can be classified as
       managed; bound it as `pe::headers` does.
       — claimed: Plastic-time, branch bugfix/r3.12-managed-header-bounds-1113
