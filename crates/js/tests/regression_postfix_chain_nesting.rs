@@ -38,6 +38,52 @@ fn postfix_chains_count_every_link() {
     }
 }
 
+/// `((f)()…)()…`: links after a closing group still wrap everything inside it, so closing the
+/// group must not drop the count. The same holds for member access, `+` and `in` after a group.
+fn grouped(link: &str, groups: usize, per_group: usize) -> String {
+    format!("{}f{};", "(".repeat(groups), format!("){}", link.repeat(per_group)).repeat(groups))
+}
+
+/// Chains split across closing groups keep counting.
+#[test]
+fn closing_a_group_keeps_the_chain_count() {
+    let mut sources: Vec<_> = ["()", "[0]", ".a", "+a", " in a"].iter().map(|link| grouped(link, 100, 60)).collect();
+    // The same split across call arguments, assignments, index brackets and function bodies.
+    let tail = format!("){}", "()".repeat(60)).repeat(100);
+    sources.push(format!("{}x{tail};", "f(".repeat(100)));
+    sources.push(format!("{}x{tail};", "(y = ".repeat(100)));
+    sources.push(format!("{}x{};", "a[".repeat(100), format!("]{}", "[0]".repeat(60)).repeat(100)));
+    sources.push(format!("{}x{};", "(function () { return ".repeat(100), format!("}}){}", "()".repeat(60)).repeat(100)));
+    for src in sources {
+        let depth = estimate(&src);
+        assert!(depth >= 100 * 60, "{depth} for {}", &src[..24]);
+        assert!(admit(&src, &Limits::default()).is_err(), "{} must be refused", &src[..24]);
+    }
+}
+
+/// Statements, blocks and calls that are done keep nothing for the next one.
+#[test]
+fn finished_groups_leave_nothing_behind() {
+    let calls = "f(a.b.c.d);\ng(a.b.c.d)\n".repeat(1_000);
+    let bodies = "function a() { return x.y.z }\nfunction b() { return x.y.z }\n".repeat(1_000);
+    let class = format!("class A {{ {} }}", "a() { return this.x.y } get b() { return this.x.y } static c() { return a.b.c }\n".repeat(1_000));
+    let typed = "function f(a: b.c.d): T { return a }\n".repeat(1_000);
+    let ifs = "if (a.b.c.d) x();\nwhile (a.b.c.d) { y() }\n".repeat(1_000);
+    let siblings = "x = (a.b.c) && (d.e.f) || g(h.i.j).k;\n".repeat(1_000);
+    for src in [calls, bodies, class, typed, ifs, siblings] {
+        let depth = estimate(&src);
+        assert!(depth < 16, "{depth} for {}", &src[..24]);
+    }
+}
+
+/// A promise chain counts about one level per link, as its member accesses already did; the
+/// callbacks' bodies don't add up.
+#[test]
+fn callback_chains_count_once_per_link() {
+    let depth = estimate(&format!("p{};", ".then((x) => x.a.b.c)".repeat(40)));
+    assert!((40..60).contains(&depth), "{depth}");
+}
+
 /// A comment between two links does not end the chain.
 #[test]
 fn comments_do_not_break_a_chain() {
@@ -105,6 +151,13 @@ fn deep_call_chain_takes_the_lexer_fallback() {
 fn deep_spaced_call_chain_takes_the_lexer_fallback() {
     let src = format!("f{};", "()\u{a0}".repeat(2_000_000));
     assert_eq!(analyze("spaced.js", &src, &Limits::default()).facts.mode, ParseMode::Lexer);
+}
+
+/// The same for two million calls split across 2,000 closing groups.
+#[test]
+fn deep_grouped_call_chain_takes_the_lexer_fallback() {
+    let analysis = analyze("grouped.js", &grouped("()", 2_000, 1_000), &Limits::default());
+    assert_eq!(analysis.facts.mode, ParseMode::Lexer);
 }
 
 /// The same for two million labels in a row.
