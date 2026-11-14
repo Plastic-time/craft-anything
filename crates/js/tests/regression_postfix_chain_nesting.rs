@@ -45,6 +45,27 @@ fn comments_do_not_break_a_chain() {
     assert!(depth >= LINKS, "{depth}");
 }
 
+/// JavaScript whitespace outside ASCII (no-break space, byte-order mark, the other space
+/// separators) and the vertical tab separate tokens, so they can't end a chain or hide a label.
+#[test]
+fn every_javascript_space_separates_links() {
+    for space in ["\u{b}", "\u{a0}", "\u{feff}", "\u{1680}", "\u{2000}", "\u{200a}", "\u{202f}", "\u{205f}", "\u{3000}"] {
+        let calls = estimate(&format!("f{};", format!("(){space}").repeat(LINKS)));
+        let index = estimate(&format!("a{};", format!("[0]{space}").repeat(LINKS)));
+        let labels: String = (0..LINKS).map(|i| format!("l{i}:{space}")).collect();
+        let labels = estimate(&format!("{labels}debugger;"));
+        assert!(calls >= LINKS && index >= LINKS && labels + 1 >= LINKS, "{space:?}: {calls} {index} {labels}");
+    }
+}
+
+/// Those spaces are not part of a name: `typeof` and `if` on either side of one still count.
+#[test]
+fn javascript_spaces_end_names() {
+    let (tokens, _) = tokenize("typeof\u{a0}x\u{feff}if\u{3000}(a)", 100);
+    assert_eq!(tokens.iter().map(|token| token.text).collect::<Vec<_>>(), ["typeof", "x", "if", "(", "a", ")"]);
+    assert!(estimate(&format!("{}0;", "typeof\u{a0}".repeat(LINKS))) >= LINKS);
+}
+
 /// Each label after another wraps the following statement in one more node.
 #[test]
 fn consecutive_labels_count_every_label() {
@@ -77,6 +98,13 @@ fn deep_call_chain_takes_the_lexer_fallback() {
     let analysis = analyze("chain.js", &src, &Limits::default());
     assert_eq!(analysis.facts.mode, ParseMode::Lexer);
     assert!(analysis.facts.mode_reason.as_deref().is_some_and(|reason| reason.contains("nests about")), "{:?}", analysis.facts.mode_reason);
+}
+
+/// The same with a no-break space after every call, which used to end the chain for the estimate.
+#[test]
+fn deep_spaced_call_chain_takes_the_lexer_fallback() {
+    let src = format!("f{};", "()\u{a0}".repeat(2_000_000));
+    assert_eq!(analyze("spaced.js", &src, &Limits::default()).facts.mode, ParseMode::Lexer);
 }
 
 /// The same for two million labels in a row.
