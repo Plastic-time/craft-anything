@@ -1270,16 +1270,21 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
                 _ => {}
             }
             if let Some(n) = &name {
-                // Every constant shares one budget, so many long ones can't add up without end.
-                if let Some((v, true)) = self.render_value(inner, 0)
-                    && v.len() <= MAX_CONST_TEXT
-                    && v.len() <= self.const_room
-                    && let BindingPattern::BindingIdentifier(b) = &it.id
-                {
+                if let BindingPattern::BindingIdentifier(b) = &it.id {
+                    // Read the value first: it may use the binding's old one (`var u = u + "/x"`).
+                    let value = self.render_value(inner, 0);
                     let k = self.key_bind(b);
-                    self.const_room = self.const_room.saturating_sub(v.len());
-                    if let Some(old) = self.const_strings.insert(k, v) {
+                    // A new value replaces the old one even when it can't be read or kept.
+                    if let Some(old) = self.const_strings.remove(&k) {
                         self.const_room = self.const_room.saturating_add(old.len());
+                    }
+                    // Every constant shares one budget, so many long ones can't add up without end.
+                    if let Some((v, true)) = value
+                        && v.len() <= MAX_CONST_TEXT
+                        && v.len() <= self.const_room
+                    {
+                        self.const_room = self.const_room.saturating_sub(v.len());
+                        self.const_strings.insert(k, v);
                     }
                 }
                 if is_function_like(inner) {
