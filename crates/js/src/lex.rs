@@ -271,8 +271,10 @@ pub fn unescape(s: &str) -> String {
 ///
 /// Brackets add a level; operators that nest expressions (member access, binary and assignment
 /// operators, conditionals, arrows, unary prefixes) and nesting statement keywords add a level
-/// until the next `,` or `;` at the same bracket depth. Over-estimates are fine: they only send a
-/// file to the lexer fallback.
+/// until the next `,` or `;` at the same bracket depth. So do a call, index or template that
+/// follows another (`f()()`, `a[0][1]`, a chain of tagged templates) and a label that follows
+/// another (`a: b: c;`): each wraps what came before in one more node, though its brackets close.
+/// Comments are skipped. Over-estimates are fine: they only send a file to the lexer fallback.
 pub fn nesting_estimate(tokens: &[Token<'_>]) -> usize {
     let mut n = Nesting::default();
     for t in tokens {
@@ -281,23 +283,62 @@ pub fn nesting_estimate(tokens: &[Token<'_>]) -> usize {
     n.max
 }
 
+/// What the last tokens were, as far as chains and labels need to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recent {
+    /// `)`, `]` or the end of a template: a `(`, `[` or template right after it continues a chain.
+    PostfixEnd,
+    /// A label's colon (or any colon): a name and a colon after it make another label.
+    Colon,
+    /// A name that follows a colon.
+    NameAfterColon,
+    Other,
+}
+
 /// Streaming state for [`nesting_estimate`].
 #[derive(Debug)]
 pub struct Nesting {
     stack: Vec<usize>,
     sum: usize,
     pub max: usize,
+    recent: Recent,
 }
 
 impl Default for Nesting {
     fn default() -> Self {
-        Nesting { stack: vec![0], sum: 0, max: 0 }
+        Nesting { stack: vec![0], sum: 0, max: 0, recent: Recent::Other }
     }
 }
 
 impl Nesting {
+    /// Take one token into the estimate.
     pub fn feed(&mut self, t: &Token<'_>) {
-        let Nesting { stack, sum, max } = self;
+        if t.kind == TokKind::Comment {
+            return;
+        }
+        let Nesting { stack, sum, max, recent } = self;
+        // `f()(`, `a[0][`, a template after a template: another node around the chain so far.
+        let chained = *recent == Recent::PostfixEnd
+            && match t.kind {
+                TokKind::Punct => matches!(t.text, "(" | "["),
+                TokKind::Template => t.text.starts_with('`'),
+                _ => false,
+            };
+        // `a: b:`: a label after a label. `default` is a case clause, not a label.
+        let labelled = *recent == Recent::NameAfterColon && t.kind == TokKind::Punct && t.text == ":";
+        *recent = match t.kind {
+            TokKind::Punct if matches!(t.text, ")" | "]") => Recent::PostfixEnd,
+            TokKind::Template if t.text.len() > 1 && t.text.ends_with('`') => Recent::PostfixEnd,
+            TokKind::Punct if t.text == ":" => Recent::Colon,
+            TokKind::Ident if *recent == Recent::Colon && t.text != "default" => Recent::NameAfterColon,
+            _ => Recent::Other,
+        };
+        if (chained || labelled)
+            && let Some(n) = stack.last_mut()
+        {
+            *n += 1;
+            *sum += 1;
+        }
         let closes = match t.kind {
             TokKind::Punct => matches!(t.text, ")" | "]" | "}"),
             TokKind::Template => t.text.starts_with('}'),
