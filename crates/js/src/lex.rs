@@ -39,6 +39,21 @@ fn is_ident_part(b: u8) -> bool {
     is_ident_start(b) || b.is_ascii_digit()
 }
 
+/// Byte length of the JavaScript whitespace character at `offset` that isn't plain ASCII
+/// whitespace (the vertical tab, no-break space, byte-order mark and the other space separators),
+/// or 0.
+fn other_space_len(src: &str, offset: usize) -> usize {
+    match src.as_bytes().get(offset) {
+        Some(0x0b) => 1,
+        Some(&c) if c >= 0x80 => src
+            .get(offset..)
+            .and_then(|rest| rest.chars().next())
+            .filter(|c| matches!(c, '\u{a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'))
+            .map_or(0, char::len_utf8),
+        _ => 0,
+    }
+}
+
 fn line_terminator_len(src: &str, offset: usize) -> usize {
     match src.as_bytes().get(offset) {
         Some(b'\n' | b'\r') => 1,
@@ -72,6 +87,11 @@ pub fn scan<'a>(src: &'a str, max_tokens: usize, mut emit: impl FnMut(Token<'a>)
         let line_end = line_terminator_len(src, i);
         if line_end != 0 {
             i += line_end;
+            continue;
+        }
+        let space = other_space_len(src, i);
+        if space != 0 {
+            i += space;
             continue;
         }
         if count >= max_tokens {
@@ -134,7 +154,7 @@ pub fn scan<'a>(src: &'a str, max_tokens: usize, mut emit: impl FnMut(Token<'a>)
             i = i.min(b.len());
             tok_kind = TokKind::Template;
         } else if is_ident_start(c) {
-            while b.get(i).is_some_and(|&d| is_ident_part(d) && (d < 0x80 || line_terminator_len(src, i) == 0)) {
+            while b.get(i).is_some_and(|&d| is_ident_part(d) && (d < 0x80 || (line_terminator_len(src, i) == 0 && other_space_len(src, i) == 0))) {
                 i += 1;
             }
             tok_kind = TokKind::Ident;
@@ -274,7 +294,8 @@ pub fn unescape(s: &str) -> String {
 /// until the next `,` or `;` at the same bracket depth. So do a call, index or template that
 /// follows another (`f()()`, `a[0][1]`, a chain of tagged templates) and a label that follows
 /// another (`a: b: c;`): each wraps what came before in one more node, though its brackets close.
-/// Comments are skipped. Over-estimates are fine: they only send a file to the lexer fallback.
+/// Comments and whitespace (non-ASCII spaces included) are skipped. Over-estimates are fine: they
+/// only send a file to the lexer fallback.
 pub fn nesting_estimate(tokens: &[Token<'_>]) -> usize {
     let mut n = Nesting::default();
     for t in tokens {
