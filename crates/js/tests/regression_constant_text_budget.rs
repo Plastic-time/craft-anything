@@ -54,6 +54,24 @@ fn every_constant_shares_one_budget() {
     assert_eq!(urls.get(1).map(|url| url.1), Some(false), "the budget is spent by then: {urls:?}");
 }
 
+/// A later declaration of the same name replaces the earlier value even when the new one is too
+/// long, or isn't a constant at all: the old URL must not be reported as what is fetched.
+#[test]
+fn a_new_value_replaces_the_old_one() {
+    let long = format!("var u = 'https://first.example/'; var u = 'https://second.example/' + '{}'; fetch(u);", "a".repeat(5_000));
+    let unknown = "var u = 'https://first.example/'; var u = load(); fetch(u);";
+    let own = "var u = 'https://first.example'; var u = u + '/v1'; fetch(u);";
+    for src in [long.as_str(), unknown] {
+        let analysis = parsed(src);
+        let fetched: Vec<_> = analysis.facts.endpoints.iter().filter(|endpoint| endpoint.api == "fetch").collect();
+        assert!(fetched.iter().all(|endpoint| !endpoint.literal && !endpoint.url.contains("first")), "{fetched:?}");
+    }
+    let analysis = parsed(own);
+    let fetched: Vec<_> =
+        analysis.facts.endpoints.iter().filter(|endpoint| endpoint.api == "fetch").map(|endpoint| (endpoint.url.as_str(), endpoint.literal)).collect();
+    assert_eq!(fetched, [("https://first.example/v1", true)]);
+}
+
 /// Ordinary constants keep resolving through concatenation and templates.
 #[test]
 fn ordinary_constants_still_resolve() {
