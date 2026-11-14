@@ -1889,7 +1889,7 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-bundle-numeric-identities
 - [x] Allocate distinct recovered module paths after repeated content-hash collisions.
       — claimed: Plastic-time, branch rrfz/bugfix-r3.12-js-module-collisions
-- [ ] Bound the text JavaScript facts build from constant strings, so repeated concatenation of a constant with itself cannot grow without limit.
+- [x] Bound the text JavaScript facts build from constant strings, so repeated concatenation of a constant with itself cannot grow without limit.
       — claimed: Plastic-time, branch bugfix/r3.12-js-constant-text-budget
 - [x] Refuse oversized GNU tar long names and link targets instead of silently truncating member identities.
       — claimed: Afloat16, branch bugfix/r3.12-tar-long-identities-20261109
