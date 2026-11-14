@@ -380,6 +380,23 @@ impl<'s> FactVisitor<'s> {
         }
     }
 
+    /// Give a binding its new constant text, or none when it can't be read. The old text goes
+    /// either way, so it is never reported in place of the new value. Call after the initializer
+    /// has been visited: it may still read the old text (`var u = fetch(u)`). Every constant shares
+    /// one budget, so many long ones can't add up without end.
+    fn replace_const(&mut self, k: Key, value: Option<String>) {
+        if let Some(old) = self.const_strings.remove(&k) {
+            self.const_room = self.const_room.saturating_add(old.len());
+        }
+        if let Some(v) = value
+            && v.len() <= MAX_CONST_TEXT
+            && v.len() <= self.const_room
+        {
+            self.const_room = self.const_room.saturating_sub(v.len());
+            self.const_strings.insert(k, v);
+        }
+    }
+
     fn arg_value(&self, args: &[Argument<'_>], i: usize) -> Option<(String, bool)> {
         args.get(i).and_then(|a| a.as_expression()).and_then(|e| self.render_value(e, 0))
     }
@@ -1248,6 +1265,8 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
 
     fn visit_variable_declarator(&mut self, it: &VariableDeclarator<'a>) {
         let name = it.id.get_identifier_name().map(|n| n.to_string());
+        // The binding's new constant text, applied once the initializer has been visited.
+        let mut replacement = None;
         if let Some(init) = &it.init {
             let inner = init.get_inner_expression();
             // Aliases: require/import bindings and member re-bindings.
@@ -1271,21 +1290,8 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
             }
             if let Some(n) = &name {
                 if let BindingPattern::BindingIdentifier(b) = &it.id {
-                    // Read the value first: it may use the binding's old one (`var u = u + "/x"`).
-                    let value = self.render_value(inner, 0);
-                    let k = self.key_bind(b);
-                    // A new value replaces the old one even when it can't be read or kept.
-                    if let Some(old) = self.const_strings.remove(&k) {
-                        self.const_room = self.const_room.saturating_add(old.len());
-                    }
-                    // Every constant shares one budget, so many long ones can't add up without end.
-                    if let Some((v, true)) = value
-                        && v.len() <= MAX_CONST_TEXT
-                        && v.len() <= self.const_room
-                    {
-                        self.const_room = self.const_room.saturating_sub(v.len());
-                        self.const_strings.insert(k, v);
-                    }
+                    let value = self.render_value(inner, 0).and_then(|(v, literal)| literal.then_some(v));
+                    replacement = Some((self.key_bind(b), value));
                 }
                 if is_function_like(inner) {
                     self.name_next(inner, n.clone());
@@ -1317,12 +1323,18 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
                     self.object_prefix.push(n.clone());
                     walk::walk_variable_declarator(self, it);
                     self.object_prefix.pop();
+                    if let Some((k, value)) = replacement {
+                        self.replace_const(k, value);
+                    }
                     return;
                 }
             }
         }
         walk::walk_variable_declarator(self, it);
         self.pending_window = None;
+        if let Some((k, value)) = replacement {
+            self.replace_const(k, value);
+        }
     }
 
     fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
