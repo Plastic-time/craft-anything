@@ -294,6 +294,9 @@ pub fn unescape(s: &str) -> String {
 /// until the next `,` or `;` at the same bracket depth. So do a call, index or template that
 /// follows another (`f()()`, `a[0][1]`, a chain of tagged templates) and a label that follows
 /// another (`a: b: c;`): each wraps what came before in one more node, though its brackets close.
+/// A bracket that the expression goes on after (`((f)()).a`, `f(g(x)())()`, `(a + b) + c`) keeps
+/// what was counted inside it, since what follows wraps all of it; of siblings such as
+/// `(a) && (b)` only the deepest counts.
 /// Comments and whitespace (non-ASCII spaces included) are skipped. Over-estimates are fine: they
 /// only send a file to the lexer fallback.
 pub fn nesting_estimate(tokens: &[Token<'_>]) -> usize {
@@ -316,18 +319,31 @@ enum Recent {
     Other,
 }
 
+/// Does `t`, right after a closing bracket, carry on the expression the bracket ended?
+fn continues_after_close(t: &Token<'_>) -> bool {
+    match t.kind {
+        TokKind::Punct => !matches!(t.text, "," | ";" | "{" | ":"),
+        TokKind::Template => true,
+        TokKind::Ident => matches!(t.text, "in" | "instanceof"),
+        _ => false,
+    }
+}
+
 /// Streaming state for [`nesting_estimate`].
 #[derive(Debug)]
 pub struct Nesting {
+    /// What each open bracket has counted so far.
     stack: Vec<usize>,
     sum: usize,
     pub max: usize,
     recent: Recent,
+    /// What a bracket that just closed had counted, for the expression it may go on in.
+    carry: usize,
 }
 
 impl Default for Nesting {
     fn default() -> Self {
-        Nesting { stack: vec![0], sum: 0, max: 0, recent: Recent::Other }
+        Nesting { stack: vec![0], sum: 0, max: 0, recent: Recent::Other, carry: 0 }
     }
 }
 
@@ -337,7 +353,18 @@ impl Nesting {
         if t.kind == TokKind::Comment {
             return;
         }
-        let Nesting { stack, sum, max, recent } = self;
+        let Nesting { stack, sum, max, recent, carry } = self;
+        // `((f)())()`, `f(g(x)())()`, `(a + b) + c`: what follows a closed bracket wraps the
+        // expression it ended, so that expression's depth goes on counting at this level. Siblings
+        // (`(a) && (b)`) don't add up: the deepest one counts.
+        let carried = std::mem::take(carry);
+        if continues_after_close(t)
+            && let Some(n) = stack.last_mut()
+            && carried > *n
+        {
+            *sum += carried - *n;
+            *n = carried;
+        }
         // `f()(`, `a[0][`, a template after a template: another node around the chain so far.
         let chained = *recent == Recent::PostfixEnd
             && match t.kind {
@@ -375,6 +402,7 @@ impl Nesting {
             && let Some(n) = stack.pop()
         {
             *sum = sum.saturating_sub(n + 1);
+            *carry = n;
         }
         if opens {
             stack.push(0);
