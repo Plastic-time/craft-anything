@@ -72,6 +72,16 @@ fn a_new_value_replaces_the_old_one() {
     assert_eq!(fetched, [("https://first.example/v1", true)]);
 }
 
+/// The new declaration's initializer still reads the old value: `fetch(u)` here fetches the first
+/// URL. Only after it is the value replaced.
+#[test]
+fn the_initializer_still_reads_the_old_value() {
+    let analysis = parsed("var u = 'https://first.example/'; var u = fetch(u); fetch(u);");
+    let fetched: Vec<_> =
+        analysis.facts.endpoints.iter().filter(|endpoint| endpoint.api == "fetch").map(|endpoint| (endpoint.url.as_str(), endpoint.literal)).collect();
+    assert_eq!(fetched, [("https://first.example/", true), ("{u}", false)]);
+}
+
 /// Ordinary constants keep resolving through concatenation and templates.
 #[test]
 fn ordinary_constants_still_resolve() {
