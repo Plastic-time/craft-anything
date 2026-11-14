@@ -2295,6 +2295,8 @@ Owner: open · Status: in progress
       — claimed: Plastic-time, branch bugfix/r3.12-plist-xml-line-endings-1111
 - [x] End JavaScript line comments at every language line terminator, preserving following tokens for the nesting admission guard and lexer fallback.
       — claimed: Afloat16, branch bugfix/r3.12-js-line-comment-boundaries
+- [ ] Count call, index and tagged-template chains and consecutive labels in the JavaScript nesting estimate, so sources nested deeper than the parser's stack go to the lexer fallback instead of overflowing it.
+      — claimed: Plastic-time, branch bugfix/r3.12-js-postfix-chain-nesting
 - [x] Read and edit JSONC registrations whose line comments end at a bare carriage return.
       — claimed: Afloat16, branch bugfix/r3.12-jsonc-carriage-return-comments
 - [x] Name code-directory flags with the bits Apple uses: hard 0x100, kill 0x200, expires 0x400,
