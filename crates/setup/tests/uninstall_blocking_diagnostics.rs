@@ -160,7 +160,8 @@ fn uninstall_and_plan_distinguish_invalid_utf8_io_errors_and_malformed_syntax() 
     let dc_io = d_io.checks.iter().find(|c| c.name == "registration:cursor").expect("doctor cursor io check");
     assert_eq!(dc_io.status, CheckStatus::Fail);
     assert_eq!(words(Some(&dc_io.message), &cursor_dir), "Can't read <path>: it is a folder, not a config file");
-    assert!(!words(dc_io.remediation.as_deref(), &cursor_dir).contains("permissions"), "{dc_io:?}");
+    let fix = words(dc_io.remediation.as_deref(), &cursor_dir);
+    assert!(fix.contains("Move the folder elsewhere, then run") && fix.contains("setup") && !fix.contains("permissions"), "{dc_io:?}");
 
     let u_io = uninstall(&host_io);
     assert_eq!(u_io.status, "blocked");
@@ -185,6 +186,34 @@ fn uninstall_and_plan_distinguish_invalid_utf8_io_errors_and_malformed_syntax() 
     assert!(words(usyn.reason.as_deref(), &pi_cfg).starts_with("<path> can't be read as StrictJson"), "{usyn:?}");
     let fix = words(usyn.remediation.as_deref(), &pi_cfg);
     assert!(fix.contains("where it is") && fix.contains("uninstall") && !fix.contains("setup") && !fix.contains("move"), "{fix}");
+
+    // Setup gives the same in-place advice: moving the file would leave its other servers behind.
+    let cmd_syn = test_host(dir_syn.path()).1;
+    let p_syn = plan(&host_syn, &PlanRequest { clients: vec!["pi".into()], all_detected: false, command: cmd_syn, include_skill: false }).expect("plan syn");
+    let fix = words(p_syn.actions[0].remediation.as_deref(), &pi_cfg);
+    assert_eq!(fix, "Back up <path> and fix it where it is (it was left untouched), then run setup again.");
+}
+
+/// A malformed TOML config's parse error names the line and column but never quotes the line,
+/// which can hold a token, in plan or uninstall diagnostics.
+#[test]
+fn toml_parse_errors_do_not_quote_the_offending_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (host, cmd) = test_host(dir.path());
+    let codex = dir.path().join(".codex").join("config.toml");
+    std::fs::create_dir_all(codex.parent().expect("codex dir")).expect("mkdir codex");
+    std::fs::write(&codex, "[mcp_servers.other]\ncommand = \"x\"\nenv = { API_TOKEN = \"sk-dummy-SECRET123\" \n").expect("write malformed codex");
+
+    let p = plan(&host, &PlanRequest { clients: vec!["codex".into()], all_detected: false, command: cmd, include_skill: false }).expect("plan codex");
+    let u = uninstall(&host);
+    assert_eq!(u.status, "blocked");
+    for a in [&p.actions[0], &u.blocking[0]] {
+        let reason = words(a.reason.as_deref(), &codex);
+        assert!(reason.starts_with("<path> can't be read as Toml: TOML parse error at line 3, column "), "{reason}");
+        for text in [a.reason.as_deref(), a.remediation.as_deref()] {
+            assert!(!text.unwrap_or_default().contains("SECRET123"), "the token leaked: {a:?}");
+        }
+    }
 }
 
 /// Ordinary valid JSONC and YAML configs (including a one-line flow sibling) continue to uninstall

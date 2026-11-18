@@ -192,7 +192,7 @@ pub fn inspect_client(c: &Client, command: &[String]) -> Action {
         Err(e) => {
             a.action = ActionKind::Invalid;
             a.reason = Some(format!("{} can't be read as {:?}: {e}", c.config.display(), c.format));
-            a.remediation = Some(format!("Fix or move {} (it was left untouched), then run setup again.", c.config.display()));
+            a.remediation = Some(format!("Back up {} and fix it where it is (it was left untouched), then run setup again.", c.config.display()));
             return a;
         }
     };

@@ -19,11 +19,25 @@ pub fn parse(client: &Client, text: &str) -> Result<Value, String> {
             jsonc::parse(text, true).map(|d| d.to_value())
         }
         Format::Toml => {
-            let t: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+            let t: toml::Table = toml::from_str(text).map_err(|e| toml_error(text, &e))?;
             serde_json::to_value(t).map_err(|e| e.to_string())
         }
         Format::Yaml => yaml::parse(text),
         Format::Manual => Err("this app's config is not edited automatically".into()),
+    }
+}
+
+/// A TOML parse error as its position and message. The error's own text quotes the offending
+/// source line, which can hold a token, so it is not used.
+fn toml_error(text: &str, e: &toml::de::Error) -> String {
+    let message = e.message().trim();
+    match e.span().and_then(|s| text.get(..s.start)) {
+        Some(before) => {
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            format!("TOML parse error at line {line}, column {column}: {message}")
+        }
+        None => format!("TOML parse error: {message}"),
     }
 }
 
