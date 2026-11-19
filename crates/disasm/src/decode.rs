@@ -514,6 +514,10 @@ fn decode_x86(bitness: u32, bytes: &[u8], addr: u64, fmt: bool) -> Option<Insn> 
             _ => {}
         }
     }
+    // The stack adjustment above is implicit, but POP into SP replaces its value.
+    if kind == Kind::Pop && matches!(ops.first(), Some(Op::Reg(r)) if canonical_reg(r) == "rsp") {
+        push_unique(&mut writes, "rsp".into());
+    }
     // xor r, r / sub r, r define r without reading it.
     if matches!(kind, Kind::Xor | Kind::Sub)
         && ops.len() == 2
@@ -792,6 +796,9 @@ fn decode_a64(bytes: &[u8], addr: u64, fmt: bool) -> Option<Insn> {
                 for c in [a64_canon(n, true), a64_canon(m, false)].into_iter().flatten() {
                     push_unique(&mut reads, c);
                 }
+                if let Some(base) = a64_canon(n, true) {
+                    push_unique(&mut writes, base);
+                }
             }
             _ => ops.push(Op::Imm(0)),
         }
@@ -866,7 +873,7 @@ fn decode_a64(bytes: &[u8], addr: u64, fmt: bool) -> Option<Insn> {
         Opcode::SDIV | Opcode::UDIV => Kind::Div,
         Opcode::LDAXR | Opcode::LDAXRB | Opcode::LDAXRH => Kind::Load,
         Opcode::LDP | Opcode::LDPSW | Opcode::LDXP | Opcode::LDAXP => Kind::LoadPair,
-        Opcode::STP => Kind::StorePair,
+        Opcode::STP | Opcode::STNP => Kind::StorePair,
         Opcode::B
         | Opcode::Bcc(_)
         | Opcode::CBZ
@@ -1294,6 +1301,16 @@ impl ArmConsts {
                         *x = None;
                     }
                     return;
+                }
+            }
+            Kind::StorePair => {
+                if let Some(Op::Mem(m)) = insn.ops.get_mut(2)
+                    && m.index.is_none()
+                    && let Some(base) = m.base.as_deref().and_then(|r| self.value(r))
+                {
+                    // A writeback changes the base after the access. Keep the destination
+                    // on the memory operand, separate from known register results.
+                    m.addr = Some(base.wrapping_add_signed(m.disp));
                 }
             }
             Kind::Load | Kind::Store => {

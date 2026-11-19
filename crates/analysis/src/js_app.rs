@@ -276,12 +276,27 @@ fn html_url(raw: &str) -> std::borrow::Cow<'_, str> {
     if trimmed.contains(['\t', '\n', '\r']) { trimmed.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect::<String>().into() } else { trimmed.into() }
 }
 
-/// `p` without a `file://` prefix, in any letter case (URL schemes are case-insensitive).
-fn strip_file_url(p: &str) -> &str {
-    match p.get(..7) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("file://") => &p[7..],
-        _ => p,
+/// `p` without a `file://` prefix, in any letter case (URL schemes are case-insensitive). An empty
+/// authority and `localhost` name this computer, so `file://localhost/ui/x` is `/ui/x` like
+/// `file:///ui/x`; another host is left in place.
+fn strip_file_url(p: &str) -> std::borrow::Cow<'_, str> {
+    let Some(rest) = p.get(..7).filter(|s| s.eq_ignore_ascii_case("file://")).map(|_| &p[7..]) else { return p.into() };
+    let (host, path) = rest.split_at(rest.find(['/', '\\']).unwrap_or(rest.len()));
+    if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+        return rest.into();
     }
+    if path.is_empty() {
+        return "/".into();
+    }
+    if let Some(tail) = path.strip_prefix('\\') {
+        return format!("/{tail}").into();
+    }
+    path.into()
+}
+
+/// Whether a path names a folder: it ends in `/` or in a `.` or `..` segment (`./boot.js/.`).
+fn names_a_folder(p: &str) -> bool {
+    p.ends_with(['/', '\\']) || matches!(p.rsplit(['/', '\\']).next(), Some("." | ".."))
 }
 
 /// Whether a window's `loadURL`/`loadFile` target is remote: it has a URL scheme other than `file:`.
@@ -416,9 +431,10 @@ impl<'a> Resolver<'a> {
     /// A path written in code (`preload.js`, `renderer/index.html`), trying exact direct and unique
     /// exact-tail matches before TypeScript source counterparts.
     fn resolve_path(&self, module_dir: &str, root: &str, p: &str) -> Option<String> {
-        let p = strip_query_fragment(strip_file_url(p));
-        // A path ending in `/` names a folder, never the file without the slash.
-        if p.ends_with(['/', '\\']) {
+        let path = strip_file_url(strip_query_fragment(p));
+        let p = path.as_ref();
+        // A folder is never the file it would name without its last `/`, `.` or `..`.
+        if names_a_folder(p) {
             return None;
         }
         for base in [module_dir, root] {
@@ -651,7 +667,7 @@ pub fn analyze_application(input: &AppInput, opts: &AppOptions, cancelled: &dyn 
             }
             for p in &h.preloads {
                 let url = html_url(p);
-                let r = (!is_external_html_ref(&url) && !strip_query_fragment(&url).ends_with(['/', '\\']))
+                let r = (!is_external_html_ref(&url) && !names_a_folder(strip_query_fragment(&url)))
                     .then(|| join_rel(&dir, &url))
                     .flatten()
                     .and_then(|j| std::iter::once(j.clone()).chain(ts_source_fallbacks(&j)).find(|c| !is_ts_declaration(c) && file_set.contains(c)));

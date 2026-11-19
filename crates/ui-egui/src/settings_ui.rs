@@ -552,13 +552,13 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                                     ui.label(RichText::new(tr("Asking for its models…")).color(t.text_faint).size(theme::CAPTION));
                                 }
                                 Some((_, Some(models))) => {
-                                    // Claude Code with no choice saved passes no `--model`, so it uses
-                                    // the model its own settings name: `default` is what's shown. An
+                                    // Claude Code or Codex with no choice saved passes no model, so it
+                                    // uses the one its own settings name: `default` is what's shown. An
                                     // API backend's model is its saved `config.model`.
-                                    let claude_code =
-                                        b.kind == BackendKind::AgentCli && craft_anything_ai::cli_agents::adapter_for(&b.model).ids().contains(&"claude-code");
+                                    let own_default =
+                                        b.kind == BackendKind::AgentCli && craft_anything_ai::cli_agents::adapter_for(&b.model).offers_own_default();
                                     let picked = app.backend_options.get(&b.name).and_then(|o| o.cli_model.clone()).unwrap_or_else(|| {
-                                        if claude_code { craft_anything_ai::anthropic::CLAUDE_CODE_DEFAULT.to_string() } else { b.model.clone() }
+                                        if own_default { craft_anything_ai::anthropic::CLAUDE_CODE_DEFAULT.to_string() } else { b.model.clone() }
                                     });
                                     let shown = |m: &str| {
                                         if m == craft_anything_ai::anthropic::CLAUDE_CODE_DEFAULT {

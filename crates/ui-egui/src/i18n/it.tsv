@@ -1501,3 +1501,6 @@ Sign in to a website	Accedi a un sito web
 Some shared files could not be hard-linked and were copied instead ({size}).	Alcuni file condivisi non hanno potuto essere collegati fisicamente e sono stati copiati ({size}).
 This server lists several chat models. Choose one:	Questo server offre diversi modelli di chat. Scegline uno:
 Choose a model	Scegli un modello
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.

@@ -35,7 +35,7 @@ craft-mime = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf
 # Lenient ZIP inspection with all existing compression methods and serialized listings.
 craft-zip = { git = "https://github.com/storytold/craft-libs", rev = "1928693fbb7a4f8e6b945e614b2fac3e181476ea", features = ["lenient", "lenient-bzip2", "lenient-lzma", "lenient-zstd", "serde"] }
 # Shared bounded TAR/CPIO listing, including current compatibility fixes.
-craft-tar = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d", features = ["serde"] }
+craft-tar = { git = "https://github.com/storytold/craft-libs", rev = "3b8e426a260695af840a2cd79a064d40778f939e", features = ["serde"] }
 # XML plist reader; prerequisite craft-libs #1633 (repin after merge).
 craft-elf = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d", features = ["serde"] }
 craft-pe = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d", features = ["serde"] }
@@ -45,6 +45,8 @@ craft-sourcemap = { git = "https://github.com/storytold/craft-libs", rev = "d118
 craft-wasm = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d" }
 craft-plist = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d" }
 craft-sniff = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d" }
+craft-dex = { git = "https://github.com/storytold/craft-libs", rev = "35afed3956e14fb813f8c27bc82d65c2bce00028" }
+craft-pkcs7 = { git = "https://github.com/storytold/craft-libs", rev = "1acd07f6bc48b04df49aa00e1c3852b159151d63" }
 thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

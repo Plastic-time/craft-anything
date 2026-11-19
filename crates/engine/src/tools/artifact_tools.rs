@@ -92,7 +92,7 @@ pub(crate) struct WalkedFile {
 
 #[derive(Debug, Default)]
 pub(crate) struct Walked {
-    /// Sorted by relative path.
+    /// Sorted by relative path, folder by folder ([`path_order`]).
     pub files: Vec<WalkedFile>,
     pub dirs: Vec<String>,
     pub links: Vec<String>,
@@ -117,19 +117,33 @@ pub(crate) const WALK_CUT_NOTE: &str = "the folder listing was cut short by a fi
 
 /// A limitation naming the folders that couldn't be listed, or only in part, as (path, reason), if any (#294).
 pub(crate) fn unlisted_limitation(unlisted: &[(String, String)]) -> Option<Limitation> {
+    unlisted_note(unlisted).map(|note| Limitation::new("unlisted_folders", note))
+}
+
+/// What [`unlisted_limitation`] says, for a tool that reports in notes: the first folders by name,
+/// each with its reason, and how many more there are.
+pub(crate) fn unlisted_note(unlisted: &[(String, String)]) -> Option<String> {
     if unlisted.is_empty() {
         return None;
     }
     let first = unlisted.iter().take(5).map(|(rel, e)| format!("{rel} ({e})")).collect::<Vec<_>>().join(", ");
     let more = unlisted.len().saturating_sub(5);
-    Some(Limitation::new(
-        "unlisted_folders",
-        format!(
-            "{} folder(s) couldn't be listed in full, so some or all of what they hold is missing: {first}{}",
-            unlisted.len(),
-            if more > 0 { format!(" and {more} more") } else { String::new() }
-        ),
+    Some(format!(
+        "{} folder(s) couldn't be listed in full, so some or all of what they hold is missing: {first}{}",
+        unlisted.len(),
+        if more > 0 { format!(" and {more} more") } else { String::new() }
     ))
+}
+
+/// The error for a walk that found nothing to work on: `what` alone when the walk saw every folder,
+/// or with the folders it couldn't list and their reasons, since what was looked for may be in them.
+pub(crate) fn nothing_found_error(what: String, unlisted: &[(String, String)]) -> ToolError {
+    match unlisted_note(unlisted) {
+        None => ToolError::invalid(what),
+        Some(note) => {
+            ToolError::invalid(format!("{what}; {note}")).with_remediation("Make those folders readable (or close what holds them open), then try again.")
+        }
+    }
 }
 
 /// A limitation naming the `.gitignore` files whose rules were skipped, if any.
@@ -179,6 +193,11 @@ fn read_gitignore(dir: &Path, rel: &str, ignore: &mut Ignore, skipped: &mut Vec<
         },
         Err(_) => skipped.push((shown, "couldn't be read".into())),
     }
+}
+
+/// A walk's `unlisted` folders named from `base`, the folder walked: one input among several.
+pub(crate) fn unlisted_under(base: &str, unlisted: Vec<(String, String)>) -> impl Iterator<Item = (String, String)> + use<'_> {
+    unlisted.into_iter().map(move |(rel, e)| (if rel == "." { base.to_string() } else { format!("{base}/{rel}") }, e))
 }
 
 pub(crate) struct WalkOptions<'a> {
@@ -330,6 +349,32 @@ pub(crate) fn walk_dir_within(root: &Path, opts: &WalkOptions<'_>, limits: WalkL
     walk_dir_reading(root, opts, limits, cancel, |dir| Ok(std::fs::read_dir(dir)?.map(|e| e.map(|e| e.file_name()))))
 }
 
+/// A folder a walk has open: its listing, and how far through it the walk is.
+struct Frame {
+    dir: PathBuf,
+    rel: String,
+    depth: usize,
+    names: std::vec::IntoIter<(String, std::ffi::OsString)>,
+    unread: Unread,
+    /// The folder held more than its listing: nothing after it in path order is walked.
+    cut: bool,
+}
+
+/// Put a finished (or abandoned) folder's unreadable entries in `unlisted`, `.` for the root.
+fn report_unread(out: &mut Walked, frame: &Frame) {
+    if let Some(reason) = frame.unread.reason() {
+        out.truncated = true;
+        out.unlisted.push((if frame.rel.is_empty() { ".".to_string() } else { frame.rel.clone() }, reason));
+    }
+}
+
+/// The order a walk meets relative paths in: folder by folder, so everything inside `a` comes
+/// right after `a` and before `a-b.txt` or `a.txt`, which a plain string comparison would put first
+/// (`-` and `.` sort before `/`).
+pub(crate) fn path_order(a: &str, b: &str) -> std::cmp::Ordering {
+    a.split('/').cmp(b.split('/'))
+}
+
 /// [`walk_dir_within`], taking each folder's entry names from `read_dir`: the system's listing, or
 /// a test's that counts what is read from it.
 fn walk_dir_reading<I: Iterator<Item = std::io::Result<std::ffi::OsString>>>(
@@ -341,89 +386,108 @@ fn walk_dir_reading<I: Iterator<Item = std::io::Result<std::ffi::OsString>>>(
 ) -> Result<Walked, ToolError> {
     let mut out = Walked::default();
     let mut ignore = craft_anything_analysis::js_source::Ignore::default();
-    let mut stack: Vec<(PathBuf, String, usize)> = vec![(root.to_path_buf(), String::new(), 0)];
     let (mut entries_left, mut path_bytes_left) = (limits.max_entries, limits.max_path_bytes);
-    while let Some((dir, rel, depth)) = stack.pop() {
-        cancel.check()?;
-        if entries_left == 0 || path_bytes_left == 0 {
-            // Nothing is left to list this folder with. Whether it is empty isn't looked up, so a
-            // tree that fits its limits exactly can read as cut short; never the other way round.
-            out.truncated = true;
-            break;
-        }
-        if opts.gitignore {
-            read_gitignore(&dir, &rel, &mut ignore, &mut out.skipped_gitignores);
-        }
-        let entries = match read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if rel.is_empty() => return Err(ToolError::io(dir.display(), e)),
-            Err(e) => {
-                out.unlisted.push((rel, e.to_string()));
-                continue;
-            }
-        };
-        let prefix_len = if rel.is_empty() { 0 } else { rel.len().saturating_add(1) };
-        let listing = list_within(entries, prefix_len, entries_left, path_bytes_left, cancel)?;
-        entries_left = entries_left.saturating_sub(listing.examined);
-        path_bytes_left = path_bytes_left.saturating_sub(listing.path_bytes);
-        let mut unread = listing.unread;
-        let mut over_files = false;
-        for (name, raw) in listing.names {
+    // The folders open along the current path, outermost first. A subfolder is opened where its
+    // name sorts in its parent, before the parent's later entries, so the walk meets the tree in
+    // path order and a limit cuts it where a listing of the tree would end: a file inside an
+    // earlier folder is never dropped for a later one. Only these folders' listings are held, and
+    // they count against the entry limit.
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut to_open: Option<(PathBuf, String, usize)> = Some((root.to_path_buf(), String::new(), 0));
+    loop {
+        if let Some((dir, rel, depth)) = to_open.take() {
             cancel.check()?;
-            let path = dir.join(&raw);
-            let child_rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-            if !opts.include_hidden && name.starts_with('.') && name != ".gitignore" {
-                out.ignored += 1;
-                continue;
+            if entries_left == 0 || path_bytes_left == 0 {
+                // Nothing is left to list this folder with. Whether it is empty isn't looked up, so a
+                // tree that fits its limits exactly can read as cut short; never the other way round.
+                out.truncated = true;
+                break;
             }
-            let meta = match std::fs::symlink_metadata(&path) {
-                Ok(meta) => meta,
-                // Gone since the folder was listed: there is nothing to miss.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                // It is there, and what it is couldn't be read.
+            if opts.gitignore {
+                read_gitignore(&dir, &rel, &mut ignore, &mut out.skipped_gitignores);
+            }
+            let entries = match read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) if rel.is_empty() => return Err(ToolError::io(dir.display(), e)),
+                // What this folder holds is missing from the listing, so the walk didn't see the tree whole.
                 Err(e) => {
-                    unread.note(&e);
+                    out.truncated = true;
+                    out.unlisted.push((rel, e.to_string()));
                     continue;
                 }
             };
-            let ft = meta.file_type();
-            if ft.is_symlink() {
-                out.links.push(child_rel);
+            let prefix_len = if rel.is_empty() { 0 } else { rel.len().saturating_add(1) };
+            let listing = list_within(entries, prefix_len, entries_left, path_bytes_left, cancel)?;
+            // A cut listing read one entry more than it kept, to know the folder held more. The walk
+            // goes on into this folder's subfolders before it stops, so that read is charged too:
+            // otherwise each cut folder could read one more, past the walk's limit plus one.
+            entries_left = entries_left.saturating_sub(listing.examined.saturating_add(usize::from(listing.cut)));
+            path_bytes_left = path_bytes_left.saturating_sub(listing.path_bytes);
+            frames.push(Frame { dir, rel, depth, names: listing.names.into_iter(), unread: listing.unread, cut: listing.cut });
+            continue;
+        }
+        let Some(frame) = frames.last_mut() else { break };
+        let Some((name, raw)) = frame.names.next() else {
+            // This folder is done, with everything below it.
+            let Some(done) = frames.pop() else { break };
+            report_unread(&mut out, &done);
+            if done.cut {
+                // What the folder held past the cut sorts before the parent's later entries.
+                out.truncated = true;
+                break;
+            }
+            continue;
+        };
+        cancel.check()?;
+        let path = frame.dir.join(&raw);
+        let child_rel = if frame.rel.is_empty() { name.clone() } else { format!("{}/{name}", frame.rel) };
+        if !opts.include_hidden && name.starts_with('.') && name != ".gitignore" {
+            out.ignored += 1;
+            continue;
+        }
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            // Gone since the folder was listed: there is nothing to miss.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // It is there, and what it is couldn't be read.
+            Err(e) => {
+                frame.unread.note(&e);
                 continue;
             }
-            if ft.is_dir() {
-                if name == ".git" || (opts.skip_dir)(&child_rel) || (opts.gitignore && ignore.is_ignored(&child_rel, true)) {
-                    out.ignored += 1;
-                    continue;
-                }
-                if depth + 1 > opts.max_depth {
-                    out.truncated = true;
-                    continue;
-                }
-                out.dirs.push(child_rel.clone());
-                stack.push((path, child_rel, depth + 1));
-            } else if ft.is_file() {
-                if opts.gitignore && ignore.is_ignored(&child_rel, false) {
-                    out.ignored += 1;
-                    continue;
-                }
-                if out.files.len() >= opts.max_files {
-                    over_files = true;
-                    break;
-                }
-                out.files.push(WalkedFile { rel: child_rel, abs: path, size: meta.len() });
+        };
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            out.links.push(child_rel);
+            continue;
+        }
+        if ft.is_dir() {
+            if name == ".git" || (opts.skip_dir)(&child_rel) || (opts.gitignore && ignore.is_ignored(&child_rel, true)) {
+                out.ignored += 1;
+                continue;
             }
-        }
-        if let Some(reason) = unread.reason() {
-            out.truncated = true;
-            out.unlisted.push((if rel.is_empty() { ".".to_string() } else { rel }, reason));
-        }
-        if over_files || listing.cut {
-            out.truncated = true;
-            break;
+            if frame.depth + 1 > opts.max_depth {
+                out.truncated = true;
+                continue;
+            }
+            out.dirs.push(child_rel.clone());
+            to_open = Some((path, child_rel, frame.depth + 1));
+        } else if ft.is_file() {
+            if opts.gitignore && ignore.is_ignored(&child_rel, false) {
+                out.ignored += 1;
+                continue;
+            }
+            if out.files.len() >= opts.max_files {
+                out.truncated = true;
+                break;
+            }
+            out.files.push(WalkedFile { rel: child_rel, abs: path, size: meta.len() });
         }
     }
-    out.files.sort_by(|a, b| a.rel.cmp(&b.rel));
+    // A walk that stopped early still says which open folders had entries it couldn't read.
+    for frame in &frames {
+        report_unread(&mut out, frame);
+    }
+    out.files.sort_by(|a, b| path_order(&a.rel, &b.rel));
     Ok(out)
 }
 
@@ -672,7 +736,7 @@ fn inventory_path_unlisted(path: &Path, limits: InvLimits, cancel: &CancelToken)
         entries.extend(walked.dirs.iter().map(|d| (d.as_str(), WalkEntry::Dir)));
         entries.extend(walked.links.iter().map(|l| (l.as_str(), WalkEntry::Link)));
         entries.extend(walked.files.iter().map(|f| (f.rel.as_str(), WalkEntry::File(f))));
-        entries.sort_by(|a, b| a.0.cmp(b.0));
+        entries.sort_by(|a, b| path_order(a.0, b.0));
         let mut total = 0u64;
         for (rel, entry) in entries {
             cancel.check()?;
@@ -1102,6 +1166,65 @@ fn core_archives_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
     Ok(ToolOutput::evidence(b.build()?))
 }
 
+/// For tests of what a tool says about a walk: a real folder that can't be listed.
+#[cfg(test)]
+pub(crate) mod walk_testing {
+    use serde_json::Value;
+    use std::path::Path;
+
+    /// Keeps a folder impossible to list until it is dropped.
+    pub(crate) struct Closed {
+        #[cfg(unix)]
+        path: std::path::PathBuf,
+        #[cfg(windows)]
+        _held: std::fs::File,
+    }
+
+    /// Make `dir` fail to list (or a file fail to read) for as long as the result lives: no
+    /// permission on Unix, held without sharing on Windows. `None` where that stops nothing (a
+    /// test run as root).
+    pub(crate) fn close(dir: &Path) -> Option<Closed> {
+        #[cfg(unix)]
+        let closed = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            Closed { path: dir.to_path_buf() }
+        };
+        #[cfg(windows)]
+        let closed = {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_BACKUP_SEMANTICS: what opening a folder takes.
+            Closed { _held: std::fs::OpenOptions::new().read(true).share_mode(0).custom_flags(0x0200_0000).open(dir).unwrap() }
+        };
+        let stops = if dir.is_dir() { std::fs::read_dir(dir).is_err() } else { std::fs::read(dir).is_err() };
+        // Only root on Unix lists a folder it has no permission for; a test that returns early
+        // anywhere else would pass without having looked at anything.
+        assert!(stops || cfg!(unix), "{} is held without sharing and can still be listed", dir.display());
+        stops.then_some(closed)
+    }
+
+    #[cfg(unix)]
+    impl Drop for Closed {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// The `unlisted_folders` limitation of a tool's evidence, if it has one.
+    pub(crate) fn unlisted_message(evidence: &Value) -> Option<String> {
+        let limitations = evidence["limitations"].as_array()?;
+        limitations.iter().find(|l| l["code"] == "unlisted_folders").and_then(|l| l["message"].as_str()).map(str::to_string)
+    }
+
+    /// The evidence says it is partial and names `folder` with the system's reason for it.
+    pub(crate) fn assert_names_unlisted(evidence: &Value, folder: &str) {
+        assert_eq!(evidence["coverage"]["status"], "partial", "{evidence}");
+        let message = unlisted_message(evidence).unwrap_or_else(|| panic!("no unlisted_folders limitation: {evidence}"));
+        assert!(message.contains(&format!("{folder} (")) && message.contains("os error"), "{message}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,6 +1253,53 @@ mod tests {
             assert_eq!(inv["result"]["entries"].as_array().unwrap().iter().any(|entry| entry["note"] == "nested archive not opened: depth limit"), unopened);
             assert_eq!(inv["result"]["truncated"], false);
         }
+    }
+
+    /// The walk used to list a folder's files before opening any of its subfolders, so when the
+    /// file limit stopped it, a file inside an earlier folder was dropped for later ones, and the
+    /// inventory's sort couldn't bring it back (CodeRabbit on #2072). It walks in path order now.
+    /// A listing cut by the path-byte limit read the name that didn't fit without charging it, and
+    /// the walk then opened the cut folder's subfolders with that entry still to spend, so the
+    /// whole walk could read past its entry limit plus one (CodeRabbit on #2101).
+    #[test]
+    fn a_name_over_the_path_byte_limit_is_charged_against_the_entry_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        for f in ["a/b", "a/c", "longname"] {
+            std::fs::write(dir.path().join(f), f).unwrap();
+        }
+        // The root keeps `a` (one byte), and `longname` doesn't fit the four bytes: two read, and
+        // nothing left of the two-entry limit to open `a` with.
+        let (w, read) = walk_ordered(dir.path(), 10, WalkLimits { max_entries: 2, max_path_bytes: 4 }, |_| {});
+        assert_eq!((w.dirs.as_slice(), w.truncated, read), (["a"].map(String::from).as_slice(), true, 2));
+        assert!(read <= 2 + 1, "the walk's entry limit and one more");
+        // With room for the folder, it is opened and listed as before.
+        let (w, read) = walk_ordered(dir.path(), 10, WalkLimits { max_entries: 10, max_path_bytes: 1 << 20 }, |_| {});
+        assert_eq!((rels(&w), w.truncated, read), (vec!["a/b", "a/c", "longname"], false, 4));
+    }
+
+    #[test]
+    fn a_cut_walk_is_a_prefix_of_the_tree_in_path_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a").join("first.txt"), "first").unwrap();
+        // `a-b.txt` sorts before `a/…` as a string; folder by folder it comes after everything in `a`.
+        for f in ["a-b.txt", "z1.txt", "z2.txt", "z3.txt", "z4.txt"] {
+            std::fs::write(dir.path().join(f), f).unwrap();
+        }
+        let w = walk(dir.path(), 3, ROOMY);
+        assert_eq!((rels(&w), w.truncated), (vec!["a/first.txt", "a-b.txt", "z1.txt"], true));
+        let limits = InvLimits { max_entries: 3, ..InvLimits::default() };
+        let (inv, _) = inventory_path(dir.path(), limits, &CancelToken::default()).unwrap();
+        let paths: Vec<&str> = inv.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["a", "a/first.txt", "a-b.txt"]);
+        assert!(inv.truncated);
+        // Whole, the walk and the inventory list it in the same order.
+        let w = walk(dir.path(), 10, ROOMY);
+        assert_eq!((rels(&w), w.truncated), (vec!["a/first.txt", "a-b.txt", "z1.txt", "z2.txt", "z3.txt", "z4.txt"], false));
+        assert_eq!(path_order("a", "a/first.txt"), std::cmp::Ordering::Less);
+        assert_eq!(path_order("a/first.txt", "a-b.txt"), std::cmp::Ordering::Less);
+        assert_eq!(path_order("a/z", "a.txt"), std::cmp::Ordering::Less);
     }
 
     /// A folder's inventory used to add every folder and link before any file, so a small
@@ -1394,6 +1564,24 @@ mod tests {
         (walked, read.get())
     }
 
+    /// [`walk`], with each folder listed in the order `order` gives its names (as a system might list
+    /// them; only NTFS lists by name), and the number of entries the walk took from the listings.
+    fn walk_ordered(root: &Path, max_files: usize, limits: WalkLimits, order: impl Fn(&mut Vec<std::ffi::OsString>)) -> (Walked, usize) {
+        let skip = |_: &str| false;
+        let opts = WalkOptions { max_files, max_depth: 64, skip_dir: &skip, gitignore: false, include_hidden: true };
+        let read = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let walked = walk_dir_reading(root, &opts, limits, &CancelToken::default(), |dir| {
+            let mut names: Vec<std::ffi::OsString> = names_in(dir).map(Result::unwrap).collect();
+            names.sort();
+            order(&mut names);
+            let read = read.clone();
+            let names: Names = Box::new(names.into_iter().map(Ok).inspect(move |_| read.set(read.get() + 1)));
+            Ok(names)
+        })
+        .unwrap();
+        (walked, read.get())
+    }
+
     /// [`walk`], and the number of entries it took from the system's folder listings.
     fn walk_counting(root: &Path, max_files: usize, limits: WalkLimits) -> (Walked, usize) {
         walk_adding(root, max_files, limits, |_| Box::new(std::iter::empty()))
@@ -1567,16 +1755,36 @@ mod tests {
                 std::fs::create_dir_all(dir.path().join(format!("d{d:02}/e{e}"))).unwrap();
             }
         }
-        // Ten of the root's thirty, and nothing below them: eleven entries read in all.
-        let (w, read) = walk_counting(dir.path(), 1000, WalkLimits { max_entries: 10, max_path_bytes: 1 << 20 });
-        assert_eq!((w.dirs.len(), w.truncated, read), (10, true, 11));
-        assert!(w.dirs.is_sorted() && w.dirs.iter().all(|d| d.len() == 3 && d.starts_with('d')), "{:?}", w.dirs);
+        // A cut listing holds the entries the system returned first, so which folders are kept
+        // depends on its order; the walk is checked under two orders it may meet.
+        let in_name_order = |_: &mut Vec<std::ffi::OsString>| {};
+        let reversed = |names: &mut Vec<std::ffi::OsString>| names.reverse();
+        // Ten of the root's thirty use the whole limit (eleven read), so the first of them in name
+        // order can't be opened: what it holds comes before the rest, and the walk stops there.
+        let ten = WalkLimits { max_entries: 10, max_path_bytes: 1 << 20 };
+        let (w, read) = walk_ordered(dir.path(), 1000, ten, in_name_order);
+        assert_eq!((w.dirs.as_slice(), w.truncated, read), (["d00"].map(String::from).as_slice(), true, 11));
         assert!(w.files.is_empty());
-        // 30 at the root, d29's three, then two of d28's and the one that says d28 holds more: 36
-        // read, and the rest never opened.
-        let (w, read) = walk_counting(dir.path(), 1000, WalkLimits { max_entries: 35, max_path_bytes: 1 << 20 });
-        assert_eq!((w.dirs.len(), w.truncated, read), (35, true, 36));
-        assert!(w.dirs.iter().rev().take(2).all(|d| d.starts_with("d28/e")), "{:?}", w.dirs);
+        let (w, read) = walk_ordered(dir.path(), 1000, ten, reversed);
+        assert_eq!((w.dirs.as_slice(), w.truncated, read), (["d20"].map(String::from).as_slice(), true, 11), "d29 to d20 were returned first");
+        // And from the system's own order, whatever it is: one of the thirty, at the root.
+        let (w, read) = walk_counting(dir.path(), 1000, ten);
+        assert!(w.dirs.len() == 1 && w.dirs[0].len() == 3 && w.dirs[0].starts_with('d'), "{:?}", w.dirs);
+        assert_eq!((w.truncated, read), (true, 11));
+        // 30 at the root (all of them, so in name order), d00's three (each empty), then two of
+        // d01's and the one that says d01 holds more: 36 read, and the walk ends at the first of
+        // d01's two, which there's nothing left to open with.
+        let thirty_five = WalkLimits { max_entries: 35, max_path_bytes: 1 << 20 };
+        let (w, read) = walk_ordered(dir.path(), 1000, thirty_five, in_name_order);
+        assert_eq!(w.dirs, ["d00", "d00/e0", "d00/e1", "d00/e2", "d01", "d01/e0"]);
+        assert_eq!((w.truncated, read), (true, 36));
+        let (w, read) = walk_ordered(dir.path(), 1000, thirty_five, reversed);
+        assert_eq!(w.dirs, ["d00", "d00/e0", "d00/e1", "d00/e2", "d01", "d01/e1"], "d01 returned e2 and e1 first");
+        assert_eq!((w.truncated, read), (true, 36));
+        let (w, read) = walk_counting(dir.path(), 1000, thirty_five);
+        assert_eq!(w.dirs[..5], ["d00", "d00/e0", "d00/e1", "d00/e2", "d01"]);
+        assert!(w.dirs.len() == 6 && w.dirs[5].starts_with("d01/e"), "{:?}", w.dirs);
+        assert_eq!((w.truncated, read), (true, 36));
         let (whole, read) = walk_counting(dir.path(), 1000, WalkLimits { max_entries: 121, max_path_bytes: 1 << 20 });
         assert_eq!((whole.dirs.len(), whole.truncated, read), (120, false, 120));
     }
@@ -1751,9 +1959,10 @@ mod tests {
             walk_adding(&root, 10, ROOMY, |d| if d.ends_with("sub") { Box::new(std::iter::repeat_with(failed)) } else { Box::new(std::iter::empty()) });
         assert_eq!((rels(&w), w.truncated, read), (everything.to_vec(), true, 3 + (2 + 64) + 1));
         assert_eq!(w.unlisted, [("sub".to_string(), "64 of its entries couldn't be read and its listing stopped there: stale entry".to_string())]);
-        // The file limit ending the walk inside that folder doesn't lose the mark.
+        // The file limit ending the walk inside that folder doesn't lose the mark: a.txt and
+        // ok/d.txt come first in path order, and the limit is reached at sub/b.txt.
         let (w, _) = walk_adding(&root, 2, ROOMY, |d| if d.ends_with("sub") { Box::new([failed()].into_iter()) } else { Box::new(std::iter::empty()) });
-        assert_eq!((rels(&w), w.truncated), (vec!["a.txt", "sub/b.txt"], true));
+        assert_eq!((rels(&w), w.truncated), (vec!["a.txt", "ok/d.txt"], true));
         assert_eq!(w.unlisted, [("sub".to_string(), "1 of its entries couldn't be read: stale entry".to_string())]);
         // The root's own entries: it is named ".".
         let at_root = root.clone();
@@ -1771,6 +1980,62 @@ mod tests {
             walk_adding(&root, 10, ROOMY, move |d| if d == at_root { Box::new([named("bad\0name")].into_iter()) } else { Box::new(std::iter::empty()) });
         assert_eq!((rels(&w), w.truncated, w.unlisted.len()), (everything.to_vec(), true, 1));
         assert!(w.unlisted.iter().all(|(rel, why)| rel == "." && why.starts_with("1 of its entries couldn't be read: ")), "{:?}", w.unlisted);
+    }
+
+    /// A folder below the root that can't be listed at all leaves the walk marked as cut short, as
+    /// entries that can't be read do: it used to be named in `unlisted` with `truncated` still
+    /// false, so a caller reading only `truncated` took the listing for the whole tree.
+    #[test]
+    fn a_folder_that_cant_be_listed_leaves_the_walk_marked_as_cut_short() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["a.txt", "ok/d.txt", "sub/b.txt"] {
+            std::fs::create_dir_all(dir.path().join(f).parent().unwrap()).unwrap();
+            std::fs::write(dir.path().join(f), f).unwrap();
+        }
+        let skip = |_: &str| false;
+        let opts = WalkOptions { max_files: 10, max_depth: 64, skip_dir: &skip, gitignore: false, include_hidden: true };
+        // The system refuses to list "sub", whatever the reason.
+        let refused = walk_dir_reading(dir.path(), &opts, ROOMY, &CancelToken::default(), |d| {
+            if d.ends_with("sub") { Err(std::io::Error::other("no entry")) } else { Ok(names_in(d)) }
+        })
+        .unwrap();
+        assert_eq!((rels(&refused), refused.truncated), (vec!["a.txt", "ok/d.txt"], true));
+        assert_eq!(refused.unlisted, [("sub".to_string(), "no entry".to_string())]);
+        // The same with a real folder the system won't list.
+        let Some(closed) = walk_testing::close(&dir.path().join("sub")) else { return };
+        let real = walk_dir(dir.path(), &opts, &CancelToken::default()).unwrap();
+        drop(closed);
+        assert_eq!((rels(&real), real.truncated, real.unlisted.len()), (vec!["a.txt", "ok/d.txt"], true, 1));
+        assert!(real.unlisted.iter().all(|(rel, why)| rel == "sub" && why.contains("os error")), "{:?}", real.unlisted);
+        assert_eq!(real.dirs, ["ok", "sub"]);
+        // Listed again once it can be.
+        let whole = walk_dir(dir.path(), &opts, &CancelToken::default()).unwrap();
+        assert_eq!((rels(&whole), whole.truncated, whole.unlisted.is_empty()), (vec!["a.txt", "ok/d.txt", "sub/b.txt"], false, true));
+        assert_eq!(
+            unlisted_under("dist", vec![(".".into(), "x".into()), ("sub".into(), "y".into())]).collect::<Vec<_>>(),
+            [("dist".to_string(), "x".to_string()), ("dist/sub".to_string(), "y".to_string())]
+        );
+    }
+
+    /// The same on every system the tests run on: `core_archive_show` names the folder it couldn't list.
+    #[test]
+    fn an_inventory_names_a_folder_it_couldnt_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(bundle.join("closed")).unwrap();
+        std::fs::write(bundle.join("closed/hidden.js"), "console.log('hidden');\n").unwrap();
+        std::fs::write(bundle.join("visible.js"), "console.log('visible');\n").unwrap();
+        let e = Engine::new(crate::testing::session());
+        let readable = call(&e, "core_archive_show", json!({"path": bundle})).unwrap();
+        assert_eq!((readable["result"]["truncated"].clone(), walk_testing::unlisted_message(&readable)), (json!(false), None));
+        let Some(closed) = walk_testing::close(&bundle.join("closed")) else { return };
+        let v = call(&e, "core_archive_show", json!({"path": bundle}));
+        drop(closed);
+        let v = v.unwrap();
+        walk_testing::assert_names_unlisted(&v, "closed");
+        assert_eq!(v["result"]["truncated"], true, "{v}");
+        assert!(v["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "truncated"), "{v}");
+        assert!(v["summary"].as_str().unwrap().contains("listing cut short"), "{v}");
     }
 
     /// #294: a folder that couldn't be listed looked like an ordinary empty folder.

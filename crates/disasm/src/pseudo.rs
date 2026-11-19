@@ -78,11 +78,48 @@ fn invalidate_dependents<K: Ord>(map: &mut BTreeMap<K, PendingAssign>, written: 
     }
 }
 
+/// Registers that can be distinguished from static addresses in this function and block.
+#[derive(Clone, Copy)]
+struct FrameBases {
+    stack: bool,
+    pointer: Option<&'static str>,
+}
+
+/// An A64 stack adjustment by an immediate preserves the stack base. A new value from
+/// another register can point into static storage, including in a later block.
+fn replaces_a64_stack(i: &Insn) -> bool {
+    if !i.writes.iter().any(|r| r == "sp") {
+        return false;
+    }
+    match (i.kind, i.ops.as_slice()) {
+        (Kind::Add | Kind::Sub | Kind::Mov, [Op::Reg(dst), Op::Reg(src), Op::Imm(_)]) if dst == "sp" && src == "sp" => false,
+        // Scalar LDR/STR and pair writebacks have an immediate offset. Vector structure
+        // loads and stores can take their increment from a register.
+        (Kind::Load | Kind::Store, [_, Op::Mem(m)]) if m.base.as_deref() == Some("sp") && (i.mnemonic.starts_with("ldr") || i.mnemonic.starts_with("str")) => {
+            false
+        }
+        (Kind::StorePair | Kind::LoadPair, [_, _, Op::Mem(m)]) if m.base.as_deref() == Some("sp") => false,
+        _ => true,
+    }
+}
+
+/// Keep the x86 stack distinct from static data only while stack writes preserve its base.
+fn replaces_x86_stack(i: &Insn) -> bool {
+    if !i.writes.iter().any(|r| r == "rsp") {
+        return false;
+    }
+    match (i.kind, i.ops.as_slice()) {
+        (Kind::Add | Kind::Sub, [Op::Reg(dst), Op::Imm(_)]) if dst == "rsp" => false,
+        (Kind::Lea, [Op::Reg(dst), Op::Mem(m)]) if dst == "rsp" && m.base.as_deref() == Some("rsp") && m.index.is_none() && m.seg.is_none() => false,
+        _ => true,
+    }
+}
+
 /// Clear `inline` on pending assignments whose expression reads memory that a write to `written`
 /// may overlap. `None` is a write whose bytes aren't known, which may overlap any read.
-fn invalidate_memory_readers(map: &mut BTreeMap<String, PendingAssign>, written: Option<&MemOp>) {
+fn invalidate_memory_readers(map: &mut BTreeMap<String, PendingAssign>, written: Option<&MemOp>, frame: FrameBases) {
     for assign in map.values_mut() {
-        if assign.inline.as_ref().and_then(|e| e.mem.as_ref()).is_some_and(|read| written.is_none_or(|w| may_overlap(read, w))) {
+        if assign.inline.as_ref().and_then(|e| e.mem.as_ref()).is_some_and(|read| written.is_none_or(|w| may_overlap(read, w, frame))) {
             assign.inline = None;
         }
     }
@@ -90,20 +127,32 @@ fn invalidate_memory_readers(map: &mut BTreeMap<String, PendingAssign>, written:
 
 /// Clear `inline` on Win64 outgoing stack arguments (`[rsp+off]`, eight bytes) that a write to
 /// `written` may change, so the call passes the slot as it is and the store that set it stays.
-fn invalidate_stack_slots(slots: &mut BTreeMap<i64, PendingAssign>, written: Option<&MemOp>) {
+fn invalidate_stack_slots(slots: &mut BTreeMap<i64, PendingAssign>, written: Option<&MemOp>, frame: FrameBases) {
+    if let Some(w) = written
+        && w.base.as_deref() == Some("rsp")
+        && w.index.is_none()
+        && w.seg.is_none()
+        && w.addr.is_none()
+        && w.size > 0
+    {
+        let first = w.disp.saturating_sub(7);
+        let last = w.disp.saturating_add(i64::from(w.size) - 1);
+        for (_, assign) in slots.range_mut(first..=last) {
+            assign.inline = None;
+        }
+        return;
+    }
     for (&off, assign) in slots.iter_mut() {
         let slot = MemOp { base: Some("rsp".into()), index: None, index_shift: None, scale: 1, disp: off, size: 8, addr: None, seg: None };
-        if written.is_none_or(|w| may_overlap(&slot, w)) {
+        if written.is_none_or(|w| may_overlap(&slot, w, frame)) {
             assign.inline = None;
         }
     }
 }
 
-/// `m` as instruction `i` accesses it, for overlap checks. The A64 decoder leaves widths unknown;
-/// a load or store moves its data registers, so their widths (both, for a pair) bound the bytes it
-/// touches: never fewer, since `ldrb w0` is counted as four bytes and `ldrsw x0` as eight.
-fn accessed(mode: Mode, i: &Insn, m: &MemOp) -> MemOp {
-    let reg_width = |o: Option<&Op>| match o {
+/// Size of an A64 data register in bytes.
+fn reg_width(o: Option<&Op>) -> u8 {
+    match o {
         Some(Op::Reg(r)) => match r.as_bytes().first() {
             Some(b'x') => 8,
             Some(b'w') => 4,
@@ -115,39 +164,64 @@ fn accessed(mode: Mode, i: &Insn, m: &MemOp) -> MemOp {
             _ => 0,
         },
         _ => 0,
+    }
+}
+
+/// Memory width and sign extension of a scalar A64 load.
+fn scalar_load(i: &Insn) -> (u8, bool) {
+    match i.mnemonic.as_str() {
+        "ldrb" | "ldurb" | "ldarb" => (1, false),
+        "ldrh" | "ldurh" | "ldarh" => (2, false),
+        "ldrsb" | "ldursb" => (1, true),
+        "ldrsh" | "ldursh" => (2, true),
+        "ldrsw" | "ldursw" => (4, true),
+        _ => (reg_width(i.ops.first()), false),
+    }
+}
+
+/// Memory footprint used to check whether a pending argument survives a write.
+fn accessed(mode: Mode, i: &Insn, m: &MemOp) -> MemOp {
+    let pair_width = |start: usize| {
+        let (a, b) = (reg_width(i.ops.get(start)), reg_width(i.ops.get(start + 1)));
+        if a == 0 || b == 0 { 0 } else { a + b }
     };
     let size = match (m.size, mode, i.kind) {
-        (0, Mode::A64, Kind::Load | Kind::Store) => reg_width(i.ops.first()),
-        (0, Mode::A64, Kind::LoadPair | Kind::StorePair) => {
-            let (a, b) = (reg_width(i.ops.first()), reg_width(i.ops.get(1)));
-            if a == 0 || b == 0 { 0 } else { a + b }
-        }
+        (0, Mode::A64, Kind::Store) if matches!(i.mnemonic.as_str(), "stxp" | "stlxp") => pair_width(1),
+        (0, Mode::A64, Kind::Store) if matches!(i.mnemonic.as_str(), "stxr" | "stxrb" | "stxrh" | "stlxr" | "stlxrb" | "stlxrh") => reg_width(i.ops.get(1)),
+        (0, Mode::A64, Kind::Load) => scalar_load(i).0,
+        (0, Mode::A64, Kind::Store) => reg_width(i.ops.first()),
+        (0, Mode::A64, Kind::LoadPair | Kind::StorePair) => pair_width(0),
         (s, ..) => s,
     };
-    MemOp { size, ..m.clone() }
+    let addr = if mode == Mode::A64 && matches!(i.kind, Kind::Load | Kind::Store) && matches!(i.ops.get(1), Some(Op::Mem(_))) {
+        m.addr.or_else(|| i.refs.first().copied())
+    } else {
+        m.addr
+    };
+    MemOp { size, addr, ..m.clone() }
 }
 
 /// Whether two memory operands can share a byte. Without a known overlap they are assumed to:
 /// only the same absolute address range, or the same segment, base and index with displacements
 /// far enough apart, are told apart, and an unindexed, unsegmented frame slot never overlaps an
 /// absolute address. An access of unknown width (0) may reach any byte from its start on.
-fn may_overlap(a: &MemOp, b: &MemOp) -> bool {
+fn may_overlap(a: &MemOp, b: &MemOp, frame: FrameBases) -> bool {
     // A segment base (`fs:[rax]`) moves the address by an amount that isn't known here.
     if a.seg != b.seg {
         return true;
     }
     let ends_by = |x: i64, m: &MemOp, y: i64| m.size != 0 && x.saturating_add(i64::from(m.size)) <= y;
     let apart = |x: i64, y: i64| ends_by(x, a, y) || ends_by(y, b, x);
-    let frame = |m: &MemOp| {
+    let is_frame = |m: &MemOp| {
         m.addr.is_none()
             && m.index.is_none()
             && m.seg.is_none()
-            && m.base.as_deref().is_some_and(|r| matches!(canonical_reg(r).as_str(), "rsp" | "rbp" | "sp" | "x29"))
+            && m.base.as_deref().is_some_and(|r| frame.stack && (matches!(r, "rsp" | "esp" | "sp") || Some(r) == frame.pointer))
     };
     match (a.addr, b.addr) {
         (Some(x), Some(y)) => !apart(x as i64, y as i64),
-        (Some(_), None) => !frame(b),
-        (None, Some(_)) => !frame(a),
+        (Some(_), None) => !is_frame(b),
+        (None, Some(_)) => !is_frame(a),
         (None, None) => {
             let same = |p: &Option<String>, q: &Option<String>| p.as_deref().map(canonical_reg) == q.as_deref().map(canonical_reg);
             // The scale and extension only matter with an index.
@@ -207,6 +281,29 @@ fn ty(size: u8) -> &'static str {
         16 => "uint128_t",
         _ => "void",
     }
+}
+
+/// Dereference a scalar load with its encoded width and sign extension.
+fn scalar_deref(mode: Mode, i: &Insn, addr: &str) -> String {
+    let word = matches!(i.ops.first(), Some(Op::Reg(r)) if r.starts_with('w'));
+    let ty = match mode {
+        Mode::A32 | Mode::T32 => "uint32_t",
+        Mode::A64 => {
+            let (width, signed) = scalar_load(i);
+            let name = ty(width);
+            if signed {
+                name.trim_start_matches('u')
+            } else if width == 0 {
+                "uint64_t"
+            } else {
+                name
+            }
+        }
+        _ => "uint64_t",
+    };
+    // Writing W zeroes the high half of X even for a sign-extending load.
+    let cast = if word && ty.starts_with("int") { "(uint32_t)" } else { "" };
+    format!("{cast}*({ty}*){addr}")
 }
 
 /// A shifted or extended register as C: the shift's signedness and width are spelled out, since
@@ -427,7 +524,7 @@ impl Lifter<'_> {
     }
 
     /// Statements for one block plus its branch condition.
-    fn block(&mut self, insns: &[Insn], entry_or_exit: bool) -> BlockCode {
+    fn block(&mut self, insns: &[Insn], entry_or_exit: bool, stack_is_frame: bool) -> BlockCode {
         let mut stmts: Vec<String> = Vec::new();
         // canonical reg → pending assignment of its latest value in this block
         let mut defs: BTreeMap<String, PendingAssign> = BTreeMap::new();
@@ -441,10 +538,20 @@ impl Lifter<'_> {
         let mut dead: BTreeSet<usize> = BTreeSet::new();
         // Win64 outgoing stack arguments stored in this block: rsp offset → pending assignment.
         let mut stack_args: BTreeMap<i64, PendingAssign> = BTreeMap::new();
+        // A split argument may be initialized high half first, before its low-address store.
+        let mut written_slots = BTreeSet::new();
         // Registers assigned in this block whose assignment a later read took out of `defs`:
         // still set here, so a memory-indirect call's base among them is still an argument.
         let mut read_after_set: BTreeSet<String> = BTreeSet::new();
+        let mut frame = FrameBases { stack: stack_is_frame, pointer: None };
         for (k, i) in insns.iter().enumerate() {
+            if i.writes.iter().any(|r| matches!(r.as_str(), "rbp" | "x29")) {
+                frame.pointer = match (i.kind, i.ops.as_slice()) {
+                    (Kind::Mov, [Op::Reg(dst), Op::Reg(src)]) if i.mnemonic == "mov" && dst == "rbp" && src == "rsp" => Some("rbp"),
+                    (Kind::Add | Kind::Mov, [Op::Reg(dst), Op::Reg(src), Op::Imm(_)]) if dst == "x29" && src == "sp" => Some("x29"),
+                    _ => None,
+                };
+            }
             let exclusive_memory = self.mode == Mode::A64
                 && matches!(
                     i.mnemonic.as_str(),
@@ -522,12 +629,36 @@ impl Lifter<'_> {
                 | Kind::Sar => i.ops.first().and_then(mem_op).map(Some),
                 // An instruction the lifter doesn't model (A32 `strb`, x86 `stosb`) may write its
                 // memory operand at a width that isn't known, or memory it doesn't name at all.
+                Kind::Other if self.mode.is_x86() => match (i.mnemonic.split_ascii_whitespace().next_back(), i.ops.as_slice()) {
+                    (Some("bts" | "btr" | "btc"), [Op::Mem(_), Op::Reg(_)]) => Some(None),
+                    (Some("movdir64b"), [Op::Reg(base), Op::Mem(_)]) if self.mode == Mode::X64 && canonical_reg(base) != *base => Some(None),
+                    (Some("movdir64b"), [Op::Reg(base), Op::Mem(_)]) => {
+                        Some(Some(MemOp { base: Some(base.clone()), index: None, index_shift: None, scale: 1, disp: 0, size: 64, addr: None, seg: None }))
+                    }
+                    _ => Some(i.ops.iter().find_map(mem_op).map(|m| MemOp { size: 0, ..m })),
+                },
                 Kind::Other => Some(i.ops.iter().find_map(mem_op).map(|m| MemOp { size: 0, ..m })),
                 _ => None,
             };
+            let mut prior_slot_write = false;
             if let Some(w) = &written {
-                invalidate_memory_readers(&mut defs, w.as_ref());
-                invalidate_stack_slots(&mut stack_args, w.as_ref());
+                if self.win64
+                    && let Some(w) = w
+                    && w.base.as_deref() == Some("rsp")
+                    && w.index.is_none()
+                    && w.seg.is_none()
+                    && w.size > 0
+                {
+                    let first = (w.disp & !7).max(0x20);
+                    let last = w.disp.saturating_add(i64::from(w.size) - 1) & !7;
+                    for slot in (first..=last).step_by(8) {
+                        if !written_slots.insert(slot) && slot == w.disp {
+                            prior_slot_write = true;
+                        }
+                    }
+                }
+                invalidate_memory_readers(&mut defs, w.as_ref(), frame);
+                invalidate_stack_slots(&mut stack_args, w.as_ref(), frame);
             }
             // AArch64 page loads and import-slot loads are shown through what uses them.
             if i.kind == Kind::Adrp
@@ -546,6 +677,7 @@ impl Lifter<'_> {
                 }
                 if i.writes.iter().any(|w| w == "rsp") {
                     stack_args.clear();
+                    written_slots.clear();
                 }
                 continue;
             }
@@ -564,21 +696,23 @@ impl Lifter<'_> {
             };
             // The memory this instruction's value comes from (a load, or an operation with a memory
             // source); `lea` only computes an address. A PC-relative literal load names its fixed
-            // address as an `Addr` operand, and reads it at a width taken as unknown.
+            // address as an `Addr` operand.
             let read_mem = match i.kind {
                 Kind::Lea | Kind::Store | Kind::StorePair => None,
                 _ => i.ops.iter().skip(1).find_map(|o| match o {
                     Op::Mem(m) => Some(accessed(self.mode, i, m)),
-                    &Op::Addr(a) if i.kind == Kind::Load => {
-                        Some(MemOp { base: None, index: None, index_shift: None, scale: 0, disp: 0, size: 0, addr: Some(a), seg: None })
-                    }
+                    &Op::Addr(a) if i.kind == Kind::Load => Some(accessed(
+                        self.mode,
+                        i,
+                        &MemOp { base: None, index: None, index_shift: None, scale: 0, disp: 0, size: 0, addr: Some(a), seg: None },
+                    )),
                     _ => None,
                 }),
             };
             let frame_reg = |r: &str| matches!(canonical_reg(r).as_str(), "rsp" | "rbp" | "sp" | "x29" | "x30");
             match (i.kind, &i.flow) {
-                // Plain assignments would lose the exclusive monitor and conditional-store semantics.
-                _ if exclusive_memory => {
+                // Keep the exclusive monitor and unrepresented SIMD pair operands in assembly.
+                _ if exclusive_memory || (i.kind == Kind::StorePair && !matches!(i.ops.first(), Some(Op::Reg(_)))) => {
                     self.asm_fallbacks += 1;
                     stmt = Some(format!("__asm(\"{}\");", escape(&i.text())));
                 }
@@ -626,6 +760,7 @@ impl Lifter<'_> {
                         a
                     };
                     stack_args.clear();
+                    written_slots.clear();
                     let uses_ret = insns
                         .get(k + 1..)
                         .unwrap_or(&[])
@@ -809,9 +944,14 @@ impl Lifter<'_> {
                 (Kind::Not, _) => stmt = Some(format!("{0} = ~{0};", d.clone().unwrap_or_default())),
                 (Kind::Neg, _) => stmt = Some(format!("{0} = -{0};", d.clone().unwrap_or_default())),
                 (Kind::Load, _) if i.ops.len() >= 2 => {
-                    let deref_ty = if matches!(self.mode, Mode::A32 | Mode::T32) { "uint32_t" } else { "uint64_t" };
                     let e = match i.refs.first() {
-                        Some(&r) => self.addr_name(r).unwrap_or_else(|| format!("*({deref_ty}*){r:#x}")),
+                        Some(&r) => self.addr_name(r).unwrap_or_else(|| scalar_deref(self.mode, i, &format!("{r:#x}"))),
+                        None if self.mode == Mode::A64
+                            && scalar_load(i).0 < reg_width(i.ops.first())
+                            && let Some(Op::Mem(m)) = i.ops.get(1) =>
+                        {
+                            scalar_deref(self.mode, i, &format!("({})", self.mem_addr(m)))
+                        }
                         None => s.clone().unwrap_or_default(),
                     };
                     let e = if e.starts_with("&") && i.refs.is_empty() { e.trim_start_matches('&').to_string() } else { e };
@@ -826,10 +966,28 @@ impl Lifter<'_> {
                 }
                 (Kind::LoadPair | Kind::StorePair, _) => {
                     let all_frame = i.ops.iter().take(2).all(|o| matches!(o, Op::Reg(r) if frame_reg(r)));
-                    if !(entry_or_exit && all_frame) {
+                    let stack_pair = matches!(i.ops.get(2), Some(Op::Mem(m)) if m.base.as_deref() == Some("sp") && m.index.is_none());
+                    let frame_save = i.kind == Kind::StorePair
+                        && i.mnemonic == "stp"
+                        && matches!(i.ops.as_slice(), [Op::Reg(fp), Op::Reg(lr), _] if fp == "x29" && lr == "x30")
+                        && matches!(i.ops.get(2), Some(Op::Mem(m)) if m.disp < 0)
+                        && i.writes.iter().any(|r| r == "sp");
+                    if !(entry_or_exit && all_frame && stack_pair && frame.stack && (i.kind == Kind::LoadPair || frame_save)) {
                         let (a, b) = (d.clone().unwrap_or_default(), s.clone().unwrap_or_default());
-                        let m = t.clone().unwrap_or_default();
-                        stmt = Some(if i.kind == Kind::LoadPair { format!("{a} = {m}[0]; {b} = {m}[1];") } else { format!("{m}[0] = {a}; {m}[1] = {b};") });
+                        if i.kind == Kind::LoadPair {
+                            let m = t.clone().unwrap_or_default();
+                            stmt = Some(format!("{a} = {m}[0]; {b} = {m}[1];"));
+                        } else if let Some(Op::Mem(m)) = i.ops.get(2) {
+                            if m.base.as_ref().is_some_and(|base| i.writes.contains(base)) {
+                                self.asm_fallbacks += 1;
+                                stmt = Some(format!("__asm(\"{}\");", escape(&i.text())));
+                            } else {
+                                let elem = ty(reg_width(i.ops.first()));
+                                let base = m.addr.map(|addr| format!("{addr:#x}")).unwrap_or_else(|| self.mem_addr(m));
+                                let ptr = format!("(({elem}*)({base}))");
+                                stmt = Some(format!("{ptr}[0] = {a}; {ptr}[1] = {b};"));
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -854,12 +1012,18 @@ impl Lifter<'_> {
                     && m.index.is_none()
                     && m.seg.is_none()
                     && m.disp >= 0x20
+                    && m.disp % 8 == 0
                     && let Some((lhs, rhs)) = stmts.last().and_then(|l| l.split_once(" = "))
                 {
                     let target = lhs.trim().to_string();
                     let v = rhs.trim_end_matches(';').to_string();
-                    stack_args
-                        .insert(m.disp, PendingAssign { target, inline: Some(InlineExpr { idx: stmts.len() - 1, expr: v, deps: i.reads.clone(), mem: None }) });
+                    let inline = (m.size == 8 || (m.size > 0 && m.size < 8 && !prior_slot_write)).then(|| InlineExpr {
+                        idx: stmts.len() - 1,
+                        expr: v,
+                        deps: i.reads.clone(),
+                        mem: None,
+                    });
+                    stack_args.insert(m.disp, PendingAssign { target, inline });
                 }
                 if let Some(r) = &dest_reg {
                     let expr = stmts.last().and_then(|l| l.split_once(" = ").map(|(_, e)| e.trim_end_matches(';').to_string()));
@@ -899,6 +1063,7 @@ impl Lifter<'_> {
             // Moving the stack pointer shifts every slot: forget the pending stack arguments.
             if i.writes.iter().any(|w| w == "rsp") {
                 stack_args.clear();
+                written_slots.clear();
             }
         }
         let stmts = stmts.into_iter().enumerate().filter(|(i, _)| !dead.contains(i)).map(|(_, s)| s).collect();
@@ -1478,12 +1643,17 @@ pub fn lift(img: &Image, prog: &Program, f: &Function, names: &dyn Fn(u64) -> Op
     let mut lifter =
         Lifter { img, prog, names, mode, arg_regs, win64, tail_calls: &f.tail_calls, ret_reg, calls: BTreeSet::new(), strings: Vec::new(), asm_fallbacks: 0 };
     let n = f.blocks.len();
+    let stack_is_frame = match mode {
+        Mode::A64 => !per_block.iter().flatten().any(replaces_a64_stack),
+        Mode::X64 => !per_block.iter().flatten().any(replaces_x86_stack),
+        _ => true,
+    };
     let codes: Vec<BlockCode> = per_block
         .iter()
         .zip(&f.blocks)
         .map(|(v, b)| {
             let edge = b.start == f.entry || b.succs.is_empty();
-            lifter.block(v, edge)
+            lifter.block(v, edge, stack_is_frame)
         })
         .collect();
     let structured_ok = n <= MAX_STRUCTURED_BLOCKS;
@@ -1584,6 +1754,21 @@ mod tests {
     use crate::program::Limits;
     use craft_anything_testkit as tk;
     use std::sync::Arc;
+
+    /// The eight-byte slots straddling the write are the only ones that lose their values.
+    #[test]
+    fn fixed_stack_writes_invalidate_only_intersecting_slots() {
+        let mut slots = (0..10_000)
+            .map(|offset| {
+                let expr = InlineExpr { idx: 0, expr: String::new(), deps: Vec::new(), mem: None };
+                (offset, PendingAssign { target: String::new(), inline: Some(expr) })
+            })
+            .collect::<BTreeMap<_, _>>();
+        let write = MemOp { base: Some("rsp".into()), index: None, index_shift: None, scale: 1, disp: 32, size: 4, addr: None, seg: None };
+        invalidate_stack_slots(&mut slots, Some(&write), FrameBases { stack: true, pointer: None });
+        let invalid: Vec<_> = slots.iter().filter(|(_, assign)| assign.inline.is_none()).map(|(&off, _)| off).collect();
+        assert_eq!(invalid, (25..=35).collect::<Vec<_>>());
+    }
 
     fn setup(bytes: Vec<u8>) -> (Image, Program) {
         let img = Image::parse(Arc::from(bytes)).unwrap();

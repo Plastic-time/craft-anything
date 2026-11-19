@@ -6,9 +6,13 @@ use crate::i18n::{tr, trf};
 use crate::state::Modal;
 use crate::theme::{self, Tokens};
 use crate::{CraftApp, icons, widgets};
-use craft_anything_ai::rebuild::replaced_builder_notice;
 use craft_anything_ai::{BackendConfig, BackendKind};
 use egui::{RichText, Ui, Vec2};
+
+/// Localise only the UI notice; headless callers keep the AI layer's English response.
+pub(crate) fn replaced_builder_notice(saved: &str, used: &str) -> String {
+    trf("The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.", &[("saved", saved), ("used", used)])
+}
 
 /// A live agent catalogue and a draft selection, tied to the settings that were queried.
 pub struct AgentModelPicker {

@@ -550,8 +550,9 @@ been run live.
       Not run against a live provider — claimed: justinjohn0306, branch `feature/r5.4-requests-per-minute`
 - [x] Offer `requests_per_minute` in Settings → AI and `ai request-rate` (#668)
       — PR #1841; claimed: rudycelekli, branch feature/r5.4-request-rate-setting
-- [ ] Say in the feed when a build is waiting for its turn (#668); a tokens-per-minute limit
-      isn't covered either
+- [x] Say in the feed when a build is waiting for its turn (#668)
+      — claimed: justinjohn0306, branch feature/r5.4-say-when-a-request-waits
+- [ ] A tokens-per-minute limit isn't covered by the request pacing (#668)
 - [x] Find LM Studio on another port (#73): the port in its settings file (when it is there) and
       the ports 1235-1239 are probed like the usual servers; OpenCode's own `baseURL`s were already
       read (#83)
@@ -617,8 +618,15 @@ Owner: open · Status: todo
       saved builder that is off or gone and the AI building instead: the CLI prints it before the
       run, `rebuild_start` adds `builder_notice`, and an answered question carries it
       — claimed: AlexJoaquimPereira, branch `bugfix/r5.5-headless-builder-notice`
-- [ ] The saved-builder replacement notice is English only for now; add it to the catalogs after a
-      native speaker checks the wording
+- [x] Add the saved-builder replacement notice on Make and at build starts to the UI catalogs;
+      Turkish wording reviewed and approved by native speaker @MacallanTheRoot, English unchanged
+      — claimed: MacallanTheRoot, branch fix/r5.5-localize-builder-replacement-notice
+- [ ] Native-speaker reviews of the saved-builder replacement notice in the other UI languages;
+      their catalog entries retain the existing English wording until reviewed
+- [x] Localize the replacement notice shown after Just ask using typed replacement names from the
+      answer (`builder_replacement.saved` and `.used`); `builder_notice` keeps its English wording
+      for headless callers. The UI reuses the existing catalog template and preserves literal names.
+      — claimed: MacallanTheRoot, branch bugfix/r5.5-just-ask-builder-notice — PR #2142
 - [x] Bound accumulated data across all lines of one server-sent event, so short lines cannot
       grow a streamed API response without limit
       — claimed: Afloat16, branch bugfix/r5.5-bounded-sse-events-20261103
@@ -818,12 +826,16 @@ yet, and the quick start is how every new person begins.
       Ghidra's setup's Java and `engines_install jadx`: Java source of a class came back (before:
       JADX exited 1)
       — claimed: Fadlalla-ai, branch bugfix/r5.7-jadx-uses-managed-java
-- [x] A Ghidra folder setting that names a file, such as the `/usr/bin/ghidra` start script, is listed as
+- [x] A Ghidra folder setting that names a file, such as a `/usr/bin/ghidra` start script, is listed as
       found by `engines_list`, but Deep mode then quietly decompiles with the built-in lifter instead;
       refuse it, or follow the script to its Ghidra folder. A file is now run only when it is the
-      headless launcher or a script that runs it; a link or start script is followed to its Ghidra
-      folder; anything else isn't listed as found. Live in Debian 13 with Ghidra 12.1.4 laid out as
-      Arch-based packages do: `/usr/bin/ghidra` and a linked `ghidraRun` now decompile with Ghidra
+      headless launcher or a short text file that names it (whether it runs it isn't checked); any
+      other file in a Ghidra folder, or in a folder directly inside one, gives that folder's
+      launcher, links followed (the file itself isn't checked); a start script elsewhere is followed
+      to the Ghidra folder it names; anything else isn't listed as found.
+      Live in Debian 13 with Ghidra 12.1.4, a `/usr/bin/ghidra` start script we wrote and a linked
+      `ghidraRun`: both now decompile with Ghidra. Arch's own package (12.2) links `/usr/bin/ghidra`
+      to `ghidraRun` instead; tried later, it is found with each setting (#85)
       — claimed: Fadlalla-ai, branch bugfix/r5.7-ghidra-setting-names-a-file
 - [x] Two cases left by the line above (review of #1949): a wrapper script in Ghidra's own folder
       that runs the launcher was passed over for that folder's launcher, and a start script naming a
@@ -1040,6 +1052,9 @@ Owner: open · Status: in progress
       document functions touched by the OpenCode model-selection changes.
 - [x] Integrate the five-level `Effort` type from #395 for agent variants, and share a strict
       disk-based selection save between the hub and headless tools, preserving unrelated edits.
+- [x] Settings → AI offers no model choice for Codex, so its model can only be set by editing
+      config.toml (#2109): offer Codex's own listed models (`codex debug models`) and its default
+      — claimed: justinjohn0306, branch bugfix/r2.2-codex-model-picker
 - [x] Rebase onto main after #395's squash merge, preserve extra model arguments without a saved
       selection, and render the remote-host placeholder visibly in the setup instructions.
 - [x] Hold the UI settings worker's session guard through its disk save so it cannot overwrite
@@ -1224,7 +1239,12 @@ Owner: open · Status: in progress
       path, not `-z`'s one-shot run, so check what it prints and approves before moving to it.
       For the others, find in their source whether they read a message from stdin or a file
 - [ ] A note sent during a build reaches the builder at its next step on other coding agents with
-      tool hooks, and on the API-backend loop between tool calls (Claude Code only today)
+      tool hooks (Claude Code only today)
+- [x] A note sent during a build reaches an API-backend builder between tool calls, not only after
+      its turn: after each tool step the loop claims the waiting notes and adds them after the
+      results (`LoopConfig::notes`, the hook's own wording), and the build relays them to the feed
+      as read (`a_note_reaches_an_api_builder_between_tool_calls`)
+      — claimed: justinjohn0306, branch feature/r2.2-notes-between-api-tool-calls
 - [ ] Session copies for other agents that keep sessions (ACP agents' `session/load`) (#451)
 - [x] Hermes Agent's native Windows install (`%LOCALAPPDATA%\hermes\bin`) is searched, so an app
       started before the install, or by a launcher, finds it (#116)
@@ -1510,6 +1530,16 @@ Owner: maintainers · Status: in progress
 ### R2.9 Everyday use: typing, projects, settings
 Owner: maintainers · Status: in progress
 Gaps found while using the app for real projects.
+- [x] `i18n::trf` filled placeholders with repeated replacements, so a value containing a later
+      placeholder was rewritten. It now fills them in one pass over the template: inserted names
+      and other values stay literal, and unknown names and stray braces are kept as written. The
+      R5.5 saved-builder notice uses it instead of its own split
+      — claimed: mansur-akhmadi, branch bugfix/r2.9-trf-literal-values
+- [x] The engine build steps (`rebuild::stacks`) filled `{editor}`, `{player}` and `{ext}` with
+      chained `replace` calls, so an editor path holding `{ext}` or `{player}` was rewritten. The
+      one-pass fill now lives in `platform::text::fill` (L2), which both the steps and
+      `i18n::trf` use, so the editor's path reaches the builder as it is
+      — claimed: mansur-akhmadi, branch bugfix/r2.9-stack-steps-literal-values
 - [x] Each project chooses, per kind of action, what the builder's approvals get (allow, ask or
       refuse): reading the web, commands, files outside the project, pushing and publishing,
       deleting outside the project, system changes, other tools. Unset kinds follow Auto mode as
@@ -2041,8 +2071,13 @@ Owner: open · Status: in progress
       folder or archive no longer shown is ignored, including its error; UI regressions cover both
       scopes and an ignored error
       — claimed: AlexJoaquimPereira, branch bugfix/r3.9-game-files-stale-results
-- [ ] Pick game A, B, then A again while the first A look is still running: the older A result can
-      still land after the newer one. Correlate each look with a request id, not only the path
+- [x] Pick game A, B, then A again while the first A look is still running: the older A result can
+      still land after the newer one. Done: each look and listing carries the job that asked for
+      it, and only the jobs the screen still waits for are applied, so a repeated pick ignores the
+      older answer; a folder whose name isn't text is refused with a message before a look starts.
+      UI regressions cover the same-folder re-pick through the app's dispatch, the refusal, and a
+      failed or superseded worker settling only its own spinner
+      — claimed: AlexJoaquimPereira, branch bugfix/r3.9-game-files-request-ids
 - [x] Decode Unreal packed 10-bit normalized and 11-bit floating-point textures through the bounded picture exporter.
       — claimed: Afloat16, branch feature/r3.9-unreal-packed-textures-20261111
 - [x] Unreal: decode cooked half- and full-precision floating-point textures with the shared bounded pixel reader.
@@ -2136,6 +2171,8 @@ Owner: open · Status: in progress
       — claimed: Plastic-time, branch bugfix/r3.11-pseudo-call-arg-followups
 - [x] In pseudo-C, keep argument loads before writes that may change them when the width is unknown, the frame slot is indexed, the segments differ, the instruction is not modelled or the load reads a literal, and stop a Win64 outgoing stack argument folding after a write to its slot (#2119 follow-up).
       — claimed: Plastic-time, branch bugfix/r3.11-pseudo-memory-write-overlap
+- [x] Preserve argument loads across implicit and multi-register writes, and limit fixed-width Win64 slot invalidation to overlapping offsets (#2124 follow-up).
+      — claimed: Plastic-time, branch bugfix/r3.11-pseudo-write-footprints
 - [ ] `native_source_folder_write` uses the built-in decompiler only: use Ghidra in Deep mode when
       it's there
 - [x] Keep source registers alive when an AArch64 arithmetic result is discarded into the zero register.
@@ -2238,9 +2275,38 @@ Owner: open · Status: in progress
       a count and the first reason (`.` for the root). The notes that named only the file-count or
       depth limit name every limit. An entry that is there but can't be looked at was run with a
       made-up name only, not with a real permission failure
-- [ ] Five calls of `walk_dir` (`apple_tools` twice, `application_tools`, `managed_tools`,
-      `web_tools`) read only `truncated`, so a folder with unreadable entries reads there as "cut
-      short" without naming the folder or the reason: pass `unlisted` on as `core_archive_show` does
+- [x] Five calls of `walk_dir` (`apple_tools` twice, `application_tools`, `managed_tools`,
+      `web_tools`) read only `truncated`, so a folder with unreadable entries read there as "cut
+      short" without naming the folder or the reason. `app_source_import`, `js_source_bundle_compare`
+      (a source folder given as a path), `apple_nib_decode`, `apple_dylibs_resolve`,
+      `managed_reconstruction_check` and `js_sources_restore` now carry an `unlisted_folders`
+      limitation (or note) naming the first five such folders with the system's reason, and how many
+      more there are (it isn't a full list), and partial coverage; a folder below the root that can't
+      be listed at all marks the walk as cut short too. When nothing is found to work on (no `.cs`
+      files, no scripts), the error names the folders that couldn't be listed and says to make them
+      readable; inputs with the same folder name are told apart (`dist (input 2)`), and
+      `apple_dylibs_resolve` is partial whenever its walk was cut. Tested on Windows with a folder
+      held without sharing; the Unix path (no permission) runs in CI
+- [x] `managed_reconstruction_check` stops reading `.cs` files at its file or size budget and says so
+      in a note, but its coverage stays complete, so members declared only in an unread file read as
+      missing in a complete check (CodeRabbit on #2106): carry the cut into coverage, apart from the
+      unlisted-folder limitation. Coverage is now partial (no total) when the file or size budget
+      stops the reading, a `.cs` file can't be read, or the folder walk was cut short (a depth or
+      entry limit), as it already was for unlisted folders. The budget, size, depth and unreadable-file
+      cases are tested (the unreadable file through `walk_testing::close`, now also for a file; run
+      on macOS only, the Windows path is untried)
+      — claimed: mansur-akhmadi, branch bugfix/r3.11-reconstruction-check-cut-coverage
+- [x] `managed_reconstruction_check` caps actual source reads with the regular-file reader: a
+      single file gets 64 MiB, and each directory file gets only the remaining aggregate budget,
+      even if it grows after inventory or during the read. A size refusal stops reading and keeps
+      coverage partial. When no source is readable, the error carries the first five source-read
+      notes, a count of further notes, the walk cut and the existing unlisted-folder details.
+      Regression tests grow or remove real files after inventory and cover exact-limit/empty
+      files, oversized single files and bounded error details. Valid source handling is unchanged.
+      — claimed: MacallanTheRoot, branch bugfix/r3.11-bounded-managed-sources — PR #2144
+- [ ] `js_sources_restore` keeps every unlisted folder of every input in memory to name five of them:
+      keep the count and the first five (CodeRabbit on #2106)
+      — claimed: hichang4u, branch bugfix/r3.11-walk-gaps-named
       — claimed: hichang4u, branch bugfix/r3.11-walk-entry-reads
 - [x] `core_archives_compare` reports `rows_capped` and a partial-coverage limitation when the
       added, removed, changed or moved lists are cut at `max_rows`, while its counts stay complete.
@@ -2250,6 +2316,23 @@ Owner: open · Status: in progress
       subfolders read "0 files in 100 entries". Folders, links and files are now one list in path
       order before the cut, and no file after the cut is read
       — claimed: hichang4u, branch bugfix/r3.11-inventory-path-order
+- [x] That path order was only the order of what the walk kept: the walk listed a folder's files
+      before opening its subfolders, so when the file limit stopped it, a file inside an earlier
+      folder (`a/first.txt`) was dropped while later root files (`z1.txt`…) were kept, and sorting
+      couldn't bring it back (CodeRabbit on #2072). The walk now opens a folder where its name sorts
+      in its parent, so a limit that stops the walk (files, entries, path bytes) cuts the tree where
+      a listing of it would end, and results are sorted folder by folder (`path_order`: everything in
+      `a` before `a-b.txt`). Only the listings of the folders on the current path are held, within
+      the same entry limit. Two limits leave a gap rather than an end: a folder past `max_depth` is
+      skipped (the walk is marked cut short) and later entries are still listed; and where a
+      folder's own listing is cut by the entry or path-byte limit, the names kept are the ones the
+      system returned first, which only NTFS returns in name order
+      — claimed: hichang4u, branch bugfix/r3.11-walk-path-order
+- [ ] A walk names entries by `to_string_lossy`, so on Unix two folders whose raw names differ only
+      in bytes that aren't UTF-8 (`a\x80`, `a\x81`) both read as `a�`: they are walked as two
+      folders but sorted as one path, so a cut walk can keep a later file and drop an earlier one
+      (CodeRabbit on #2101). Order by the raw name, or report a name that can't be shown
+      unambiguously as unlisted
 
 ### R3.12 Format parser correctness
 Owner: open · Status: in progress
@@ -2295,8 +2378,10 @@ Owner: open · Status: in progress
       references, keep local references whose query holds a URL, and stop turning unresolved
       HTML script/preload paths into `external:*` packages.
       — claimed: Plastic-time, branch bugfix/r3.12-js-app-tail-order-and-html-refs
-- [x] Treat any URL scheme of two or more characters (`data:`, `blob:`; one letter before `:` is read as a Windows drive) in `js_app` HTML refs and remote window loads as external, read HTML `src`/`href` without surrounding spaces, normalise exact tails before lookup, keep files in a `node_modules` directory segment out of tail matches, and look tails up in one index per analysis instead of scanning the inventory per reference.
+- [x] Treat any URL scheme of two or more characters (`data:`, `blob:`; one letter before `:` is read as a Windows drive) in `js_app` HTML refs and remote window loads as external, read HTML `src`/`href` without surrounding spaces, normalise exact tails before lookup, keep files in a `node_modules` directory segment out of tail matches, and look tails up in one index per analysis instead of scanning the inventory per reference (#2113).
       — claimed: Plastic-time, branch bugfix/r3.12-js-app-tail-resolution
+- [x] Read `file://localhost/` window loads as `file:///`, and treat a final `.` or `..` segment as a folder for `resolve_path` callers and HTML modulepreload references (#2113 follow-up).
+      — claimed: Plastic-time, branch bugfix/r3.12-js-app-file-localhost-dot-folders
 - [x] Preserve webpack factory parameter names when direct eval can read them.
       — claimed: Plastic-time, branch bugfix/r3.12-js-eval-param-renaming-1115
 - [x] Preserve void zero expressions when a with statement can dynamically resolve undefined.
@@ -2438,6 +2523,17 @@ Owner: open · Status: in progress
       — claimed: Chr0mium24, branch bugfix/r3.12-sqlite-real-affinity
 - [x] Tokenize tight SQLite `CREATE TABLE` identifiers, declared type spans, adjacent column constraints, signed or leading-dot `DEFAULT` clauses (`DEFAULT-5`, `DEFAULT.5`), and semicolon-terminated table options (`STRICT;`, `WITHOUT ROWID;`) without whitespace (#2108). — claimed: Plastic-time, branch bugfix/r3.12-sqlite-tight-type-and-clause-tokens
 - [x] Read `DEFAULT+X'41'` as the blob, and bare `DEFAULT` words with non-ASCII characters or a later `$` as their text, as SQLite does for rows written before the column was added, and skip a byte order mark where a token starts; the `--` after `e` fixture is DDL SQLite creates (#2108 follow-up). — claimed: Plastic-time, branch bugfix/r3.12-sqlite-default-followups
+- [x] A SQLite schema whose `sqlite_schema` b-tree couldn't be read whole (an unreadable child
+      page or row, a page of the wrong kind, a walk budget spent) was listed as complete: the
+      overview dropped the walk's `incomplete` flag and notes. `schema_truncated` is now set for
+      such a walk as well as for the object cap, its first notes are in the integrity notes, and
+      `db_sqlite_show` adds a `schema_incomplete` limitation, partial coverage, and an unknown-table
+      error that says only the listed part was searched
+      — claimed: mansur-akhmadi, branch bugfix/r3.12-sqlite-schema-incomplete
+- [x] Schema rows read only in part (cut or looping overflow chains, unread values, or text cut
+      at a per-value or aggregate schema budget) set `schema_truncated` and report how many
+      records have incomplete metadata or column lists. Display-only SQL shortening stays separate
+      — claimed: Afloat16, branch bugfix/r3.12-sqlite-partial-schema-20261119
 - [x] Require a complete DNS question's type and class fields before retaining it, and keep
       truncated questions out of packet inventories while reporting the incomplete message
       — claimed: Afloat16, branch bugfix/r3.12-dns-question-class-review-20261104
@@ -2987,6 +3083,16 @@ Owner: open · Status: in progress
       — claimed: Plastic-time, branch bugfix/r3.12-squashfs-table-bounds
 - [x] Require each raw or decoded file block to cover exactly its logical range, including the partial final block, so short blocks cannot shift later contents and long blocks cannot be hidden by truncation.
       — claimed: Afloat16, branch bugfix/r3.12-squashfs-block-output-size-20261110
+- [x] The firmware scan gave a squashfs 2.x or 3.x region the block size read at offset 12, which
+      is the uid table's start in those versions (`block_size` is there only in version 4): it
+      reads the 32-bit `block_size` they keep at offset 51, in either byte order, and leaves it
+      out of a superblock cut before it. Their description no longer names a compression read
+      from offset 20 (their inode table's start): it says unknown, as their details did
+      — claimed: mansur-akhmadi, branch bugfix/r3.12-squashfs-v3-block-size
+- [x] A squashfs 2.x or 3.x superblock is taken on its magic, version and `bytes_used` alone: check
+      its block size against its `block_log` (offset 34) as version 4's is, before calling it a
+      filesystem
+      — claimed: Afloat16, branch bugfix/r3.12-old-squashfs-block-layout-20261119
 - [x] Recover zero-filled cramfs hole blocks at full and partial page boundaries while retaining the existing recovery budgets.
       — claimed: Afloat16, branch bugfix/r3.12-cramfs-hole-blocks-20261110
 - [x] Charge firmware ZIP outputs before decoding the next member, so byte and file limits bound retained member data.

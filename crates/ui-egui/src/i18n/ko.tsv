@@ -1499,3 +1499,6 @@ Sign in to a website	웹사이트에 로그인
 Some shared files could not be hard-linked and were copied instead ({size}).	일부 공유 파일은 하드 링크할 수 없어 복사했습니다 ({size}).
 This server lists several chat models. Choose one:	이 서버에는 채팅 모델이 여러 개 있습니다. 하나를 고르세요:
 Choose a model	모델 선택
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.
