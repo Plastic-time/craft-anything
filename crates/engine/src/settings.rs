@@ -4,6 +4,7 @@ use crate::versioned::{Step, upgrade};
 use craft_anything_evidence::{ErrorCode, ToolError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -93,7 +94,8 @@ pub struct Settings {
     /// own engines and with Ghidra when it's installed. Off is Clean room: nothing inside the
     /// original is read, only what can be seen from outside ([`crate::clean_room`]).
     pub deep_mode: bool,
-    /// `studio` (dark) or `studio-light`.
+    /// `system` (follow the system's light or dark appearance, the default), `studio` (dark) or
+    /// `studio-light`.
     pub theme: String,
     /// UI language (BCP 47), empty = system.
     pub language: String,
@@ -204,7 +206,7 @@ impl Default for Settings {
             version: SETTINGS_VERSION,
             mode: Mode::Beginner,
             deep_mode: false,
-            theme: "studio".into(),
+            theme: "system".into(),
             language: String::new(),
             first_run_done: false,
             engines: EngineSettings::default(),
@@ -225,9 +227,31 @@ impl Default for Settings {
     }
 }
 
-/// How many config files that couldn't be used are kept beside config.toml
-/// (`config.toml.broken`, then `.broken.1`…): an earlier copy is never replaced by a later one.
+/// How many config files that couldn't be used are kept beside config.toml: `config.toml.broken`,
+/// then `.broken.1` to `.broken.15`. An earlier copy is never replaced by a later one.
 const BROKEN_KEPT: u32 = 16;
+
+/// What a read of `path` left unsaid when it answered "not found": a link whose target is missing
+/// (a drive that isn't attached, a folder that isn't there yet) answers like a missing file, but
+/// the link is there, and a save would replace it with a file. `None` when nothing is at `path`.
+fn link_without_target(path: &Path) -> Option<String> {
+    link_without_target_from(path, std::fs::symlink_metadata(path).map(|meta| meta.file_type().is_symlink()), std::fs::read_link(path).ok())
+}
+
+/// [`link_without_target`] from what the system said: whether `path` itself is a link, and where
+/// it points if that could be read.
+fn link_without_target_from(path: &Path, is_link: std::io::Result<bool>, target: Option<PathBuf>) -> Option<String> {
+    match is_link {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // A file put there since the read is another program's save, not something left behind.
+        Ok(false) => None,
+        Ok(true) => Some(match target {
+            Some(target) => format!("{} is a link to {}, which isn't there", path.display(), target.display()),
+            None => format!("{} is a link to a file that isn't there", path.display()),
+        }),
+        Err(e) => Some(format!("{} couldn't be looked at ({e})", path.display())),
+    }
+}
 
 /// Move a settings file that can't be used aside, under the first backup name that is free. On an
 /// error (the system refuses, or every name is taken) the file is still where it was.
@@ -359,11 +383,23 @@ impl Settings {
     /// that is there but can't be used is never a crash and never lost: one that can't be
     /// understood (not TOML, not UTF-8 text) is set aside under a new name and replaced with
     /// defaults; one that can't be read at all, or can't be set aside, stays where it is, and the
-    /// defaults returned refuse to be saved over it ([`Settings::not_loaded`]).
+    /// defaults returned refuse to be saved over it ([`Settings::not_loaded`]). A link whose
+    /// target isn't there is such a file too, not a missing one: a save would replace the link.
     pub fn load_from(path: &Path) -> Settings {
-        let bytes = match std::fs::read(path) {
+        Settings::from_read(path, std::fs::read(path))
+    }
+
+    /// [`Settings::load_from`] given what reading `path` gave.
+    fn from_read(path: &Path, read: std::io::Result<Vec<u8>>) -> Settings {
+        let bytes = match read {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Settings::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Only a path with nothing at it is a first start. A link with no target is the
+                // person's own, and saving defaults would put a file where it is.
+                let Some(why) = link_without_target(path) else { return Settings::default() };
+                log::warn!("{why}; using defaults, and changes won't be saved over it");
+                return Settings::standing_in(why);
+            }
             Err(e) => {
                 // It may hold the person's settings (a lock, a permission, a failing disk): the
                 // defaults used meanwhile must never be written over it.
@@ -407,11 +443,24 @@ impl Settings {
 
     /// Load startup settings, first recovering app edits deferred by a busy shutdown.
     pub fn load() -> Settings {
-        let path = Settings::path();
-        if let Err(e) = Self::recover_pending(&path) {
+        Settings::load_waiting(&Settings::path(), &STARTUP_READ_WAITS, &mut |p| std::fs::read(p))
+    }
+
+    /// [`Settings::load`] for `path`. A virus scan or another program may hold config.toml for a
+    /// moment, and the whole session would otherwise run on defaults that refuse every save, so
+    /// it is read again after each of `waits`.
+    fn load_waiting(path: &Path, waits: &[Duration], read_file: &mut dyn FnMut(&Path) -> std::io::Result<Vec<u8>>) -> Settings {
+        let read = read_waiting(path, waits, &mut *read_file);
+        // Still unreadable: deferred edits stay beside it for the next start, as the defaults
+        // standing in for it can't be saved. Merged into a file read now, they'd be lost when the
+        // session's own save at exit discards them.
+        if matches!(&read, Err(e) if e.kind() != std::io::ErrorKind::NotFound) {
+            return Settings::from_read(path, read);
+        }
+        if let Err(e) = Self::recover_pending(path) {
             log::warn!("Couldn't recover pending settings: {}", e.message);
         }
-        Settings::load_from(&path)
+        Settings::from_read(path, read_waiting(path, waits, read_file))
     }
 
     /// Keep pending non-AI edits without touching config.toml or waiting for the engine session.
@@ -446,7 +495,10 @@ impl Settings {
         let mut pending = read_settings(&text).map_err(bad_settings)?;
         let current = match std::fs::read_to_string(path) {
             Ok(text) => read_settings(&text).map_err(bad_settings)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match link_without_target(path) {
+                None => Settings::default(),
+                Some(why) => return Err(bad_settings(why)),
+            },
             Err(e) => return Err(ToolError::io(path.display(), e)),
         };
         if current.version > SETTINGS_VERSION || pending.version > SETTINGS_VERSION {
@@ -457,7 +509,17 @@ impl Settings {
         Self::discard_pending(path)
     }
 
+    /// Save settings privately. A non-empty parent is treated as a dedicated config directory:
+    /// create it if needed and restrict it to 0700 on Unix before replacing the 0600 file.
+    /// This includes an existing directory selected by `CRAFT_ANYTHING_CONFIG_DIR`; callers must
+    /// not select an unrelated shared directory. Ancestors are not chmodded. A bare filename does
+    /// not change the working directory's permissions. Directory preparation failure leaves any
+    /// existing config file unchanged; directory creation/permission changes are not rolled back.
     pub fn save_to(&self, path: &Path) -> Result<(), ToolError> {
+        self.save_to_with_dir_permissions(path, craft_anything_platform::fs::set_private_dir)
+    }
+
+    fn save_to_with_dir_permissions(&self, path: &Path, set_private_dir: impl FnOnce(&Path) -> Result<(), ToolError>) -> Result<(), ToolError> {
         if let Some(why) = &self.not_loaded {
             return Err(ToolError::new(ErrorCode::BadSettings, format!("Settings weren't saved: {why}, so these are defaults standing in for it."))
                 .with_remediation("Nothing was written. Make that file readable or move it aside, then start Craft Anything again."));
@@ -470,7 +532,13 @@ impl Settings {
             .with_remediation("Update Craft Anything to change settings, or move config.toml aside to start fresh. Nothing was written."));
         }
         let text = toml::to_string_pretty(self).map_err(|e| ToolError::new(ErrorCode::BadSettings, e.to_string()))?;
-        crate::project::write_atomic(path, text.as_bytes())
+        // `config.toml` can hold plugin headers and environment (API keys), so it is owner-only,
+        // as is the folder that holds it (audit: craft-anything #2).
+        if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir.display(), e))?;
+            set_private_dir(dir)?;
+        }
+        craft_anything_platform::write_atomic_private(path, text.as_bytes())
     }
 
     pub fn save(&self) -> Result<(), ToolError> {
@@ -505,6 +573,9 @@ impl Settings {
         if id == craft_anything_engines::ghidra::get::ID {
             return self.ghidra_launcher();
         }
+        if let Some(java) = (id == "java").then(|| self.java_set_for_ghidra()).flatten() {
+            return Some(java);
+        }
         if self.engines.only_configured {
             craft_anything_engines::locate_configured(id, &self.engines.tools, &self.engine_store_dir())
         } else {
@@ -512,10 +583,50 @@ impl Settings {
         }
     }
 
+    /// The `java` in the Java folder set for Ghidra, unless a path is set for the Java runtime
+    /// itself: the other Java tools (Vineflower, JADX…) run on it too.
+    pub fn java_set_for_ghidra(&self) -> Option<PathBuf> {
+        use craft_anything_engines::ToolPathLookup;
+        if self.engines.tools.override_for("java").is_some() {
+            return None;
+        }
+        let home = self.engines.ghidra.java_home.as_deref()?;
+        Some(home.join("bin").join(if cfg!(windows) { "java.exe" } else { "java" })).filter(|p| p.is_file())
+    }
+
     /// Why an engine wasn't found and what to do about it, as (reason, remediation).
     pub fn engine_not_found(&self, id: &str) -> (String, String) {
         use craft_anything_engines::ToolPathLookup;
         craft_anything_engines::not_found_help(id, self.engines.tools.override_for(id).as_deref(), craft_anything_platform::in_flatpak())
+    }
+}
+
+/// How long startup waits before each new try at a config.toml that couldn't be read: 2 s in all.
+const STARTUP_READ_WAITS: [Duration; 6] = [
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(300),
+    Duration::from_millis(400),
+    Duration::from_millis(500),
+    Duration::from_millis(500),
+];
+
+/// Read `path`, trying again after each wait while it fails in a way that may pass (a lock, a
+/// sharing violation, a denied access), not when it is missing or isn't a file at all.
+fn read_waiting(path: &Path, waits: &[Duration], mut read: impl FnMut(&Path) -> std::io::Result<Vec<u8>>) -> std::io::Result<Vec<u8>> {
+    use std::io::ErrorKind::{InvalidFilename, InvalidInput, IsADirectory, NotADirectory, NotFound};
+    let mut waits = waits.iter();
+    loop {
+        match read(path) {
+            Err(e) if !matches!(e.kind(), NotFound | IsADirectory | NotADirectory | InvalidFilename | InvalidInput) => match waits.next() {
+                Some(wait) => {
+                    log::info!("{} couldn't be read ({e}); trying again in {} ms", path.display(), wait.as_millis());
+                    std::thread::sleep(*wait);
+                }
+                None => return Err(e),
+            },
+            done => return done,
+        }
     }
 }
 
@@ -559,11 +670,40 @@ auto_mode = true
         std::fs::create_dir_all(&managed).unwrap();
         std::fs::write(managed.join(launcher_name), "").unwrap();
         assert_eq!(s.ghidra_launcher(), Some(managed.join(launcher_name)));
+        // The Java Ghidra's setup brings is the Java runtime the listing and `Requires` see.
+        let java = dir.path().join("engines").join("jdk").join("jdk-21").join("bin").join(if cfg!(windows) { "java.exe" } else { "java" });
+        std::fs::create_dir_all(java.parent().unwrap()).unwrap();
+        std::fs::write(&java, "").unwrap();
+        assert_eq!(s.engine_path("java"), Some(java));
         // It is never written to config.toml, and a loaded config looks around the computer.
         let text = toml::to_string_pretty(&s).unwrap();
         assert!(!text.contains("only_configured"), "{text}");
         let loaded: Settings = toml::from_str(&text).unwrap();
         assert!(!loaded.engines.only_configured);
+    }
+
+    #[test]
+    fn a_java_set_for_ghidra_runs_the_other_java_tools_unless_one_is_set_for_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.engines.store_dir = Some(dir.path().join("engines"));
+        s.engines.only_configured = true;
+        let exe = if cfg!(windows) { "java.exe" } else { "java" };
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        s.engines.ghidra.java_home = Some(empty);
+        assert_eq!(s.engine_path("java"), None, "a folder with no bin/java isn't a Java");
+        let home = dir.path().join("jdk");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::write(home.join("bin").join(exe), "").unwrap();
+        s.engines.ghidra.java_home = Some(home.clone());
+        assert_eq!(s.engine_path("java"), Some(home.join("bin").join(exe)));
+        let own = dir.path().join("own");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join(exe), "").unwrap();
+        s.engines.tools.java = Some(own.clone());
+        assert_eq!(s.java_set_for_ghidra(), None, "a path set for Java itself wins");
+        assert_eq!(s.engine_path("java"), Some(own.join(exe)));
     }
 
     #[test]
@@ -654,6 +794,74 @@ default = "Claude Code"
         assert_eq!(Settings::load_from(&path), Settings::default());
         assert!(path.with_extension("toml.broken").exists());
         assert!(read_settings("version = -1").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_is_saved_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Settings::default().save_to(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let nested = dir.path().join("cfg").join("config.toml");
+        Settings::default().save_to(&nested).unwrap();
+        assert_eq!(std::fs::metadata(nested.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn directory_permission_failure_leaves_config_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let old = b"previous settings";
+        std::fs::write(&path, old).unwrap();
+        let changed = Settings { language: "de".into(), ..Settings::default() };
+        let error = changed
+            .save_to_with_dir_permissions(&path, |parent| {
+                assert_eq!(parent, dir.path());
+                assert_eq!(std::fs::read(&path).unwrap(), old);
+                Err(ToolError::io(parent.display(), std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected chmod refusal")))
+            })
+            .unwrap_err();
+        assert!(error.message.contains("injected chmod refusal"));
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        let new_path = dir.path().join("new-config").join("config.toml");
+        assert!(
+            changed
+                .save_to_with_dir_permissions(&new_path, |parent| {
+                    assert!(parent.is_dir());
+                    assert!(!new_path.exists());
+                    Err(ToolError::io(parent.display(), std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected chmod refusal")))
+                })
+                .is_err()
+        );
+        assert!(!new_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_selected_existing_config_directory_is_made_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("selected-config");
+        let unrelated = root.path().join("unrelated");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        for path in [root.path(), parent.as_path(), unrelated.as_path()] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = parent.join("config.toml");
+        Settings::default()
+            .save_to_with_dir_permissions(&path, |dir| {
+                assert!(!path.exists(), "the file must not be written before securing its directory");
+                craft_anything_platform::fs::set_private_dir(dir)
+            })
+            .unwrap();
+        for (path, mode) in [(root.path(), 0o755), (parent.as_path(), 0o700), (unrelated.as_path(), 0o755), (path.as_path(), 0o600)] {
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, mode);
+        }
     }
 
     #[test]
@@ -781,6 +989,103 @@ default = "Claude Code"
         assert_eq!(Settings::load_from(&path).language, "de");
     }
 
+    /// Startup tries a file it couldn't read again, after each wait, and stops at "not found".
+    #[test]
+    fn a_config_that_cant_be_read_is_tried_again() {
+        let path = Path::new("config.toml");
+        let held = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let waits = [Duration::ZERO; 3];
+        let mut tries = 0;
+        let read = read_waiting(path, &waits, |_| {
+            tries += 1;
+            if tries < 3 { Err(held()) } else { Ok(b"language = \"de\"".to_vec()) }
+        });
+        assert_eq!((read.unwrap(), tries), (b"language = \"de\"".to_vec(), 3));
+        tries = 0;
+        let read = read_waiting(path, &waits, |_| {
+            tries += 1;
+            Err(held())
+        });
+        assert_eq!((read.unwrap_err().kind(), tries), (std::io::ErrorKind::PermissionDenied, 4));
+        tries = 0;
+        let read = read_waiting(path, &waits, |_| {
+            tries += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!((read.unwrap_err().kind(), tries), (std::io::ErrorKind::NotFound, 1));
+        // Nor is a folder where the file should be.
+        let dir = tempfile::tempdir().unwrap();
+        tries = 0;
+        let read = read_waiting(dir.path(), &waits, |p| {
+            tries += 1;
+            std::fs::read(p)
+        });
+        assert!(read.is_err());
+        if cfg!(unix) {
+            assert_eq!(tries, 1);
+        }
+        assert_eq!(STARTUP_READ_WAITS.iter().sum::<Duration>(), Duration::from_secs(2));
+    }
+
+    /// A file unreadable for a moment at startup is read once it can be, instead of the session
+    /// running on defaults that refuse every save.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_readable_again_within_the_waits_is_loaded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Settings { language: "de".into(), first_run_done: true, ..Settings::default() }.save_to(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            return; // Run as root: nothing is unreadable.
+        }
+        // Without waits, as before: defaults standing in for it.
+        assert!(Settings::from_read(&path, read_waiting(&path, &[], |p| std::fs::read(p))).not_loaded.is_some());
+        let mut tries = 0;
+        let s = Settings::from_read(
+            &path,
+            read_waiting(&path, &[Duration::ZERO; 3], |p| {
+                tries += 1;
+                if tries == 3 {
+                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                std::fs::read(p)
+            }),
+        );
+        assert_eq!((s.not_loaded, s.language.as_str(), tries), (None, "de", 3));
+    }
+
+    /// Edits deferred at the last exit are merged only into a file startup could read: while it
+    /// can't, they stay beside it (the session's save at exit would otherwise discard them).
+    #[cfg(unix)]
+    #[test]
+    fn deferred_edits_wait_for_a_config_startup_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Settings { language: "de".into(), first_run_done: true, ..Settings::default() }.save_to(&path).unwrap();
+        Settings { language: "fr".into(), first_run_done: true, ..Settings::default() }.defer_save_to(&path).unwrap();
+        let pending = path.with_extension("pending.toml");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            return; // Run as root: nothing is unreadable.
+        }
+        let s = Settings::load_waiting(&path, &[Duration::ZERO; 2], &mut |p| std::fs::read(p));
+        assert!(s.not_loaded.is_some() && s.save_to(&path).is_err());
+        assert!(pending.exists(), "kept for the next start");
+        // Readable on the second try: the edits are merged, not left for an exit save to discard.
+        let mut tries = 0;
+        let s = Settings::load_waiting(&path, &[Duration::ZERO; 2], &mut |p| {
+            tries += 1;
+            if tries == 2 {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            std::fs::read(p)
+        });
+        assert_eq!((s.not_loaded, s.language.as_str(), pending.exists()), (None, "fr", false));
+    }
+
     /// A file that can't be used and can't be set aside (here: every backup name is taken) stays
     /// where it is, and the defaults used instead are never saved over it.
     #[test]
@@ -887,5 +1192,67 @@ default = "Claude Code"
         let v2 = read_settings("version = 2\ndeep_mode = true\n").unwrap();
         assert_eq!(v2.version, SETTINGS_VERSION);
         assert!(v2.project_folders.is_empty() && v2.existing_files.is_none() && v2.deep_mode);
+    }
+
+    /// A config.toml that is a link to a file that isn't there answers "not found" like a missing
+    /// file. Only a path with nothing at it is one: the decision, from what the system says.
+    #[test]
+    fn a_link_without_its_target_isnt_a_missing_file() {
+        use std::io::{Error, ErrorKind};
+        let path = Path::new("cfg").join("config.toml");
+        // Nothing there, or a file another program has saved since the read: plain defaults.
+        assert_eq!(link_without_target_from(&path, Err(Error::from(ErrorKind::NotFound)), None), None);
+        assert_eq!(link_without_target_from(&path, Ok(false), None), None);
+        // A link is named, with where it points when that could be read.
+        let why = link_without_target_from(&path, Ok(true), Some(Path::new("elsewhere").join("config.toml"))).unwrap();
+        assert!(why.contains("config.toml is a link to elsewhere") && why.ends_with("which isn't there"), "{why}");
+        let why = link_without_target_from(&path, Ok(true), None).unwrap();
+        assert!(why.ends_with("config.toml is a link to a file that isn't there"), "{why}");
+        // Not knowing what is there isn't knowing that nothing is.
+        let why = link_without_target_from(&path, Err(Error::from(ErrorKind::PermissionDenied)), None).unwrap();
+        assert!(why.contains("couldn't be looked at"), "{why}");
+        // On disk: no file and an ordinary file are both nothing left behind.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert_eq!(link_without_target(&path), None);
+        assert_eq!(Settings::load_from(&path), Settings::default());
+        std::fs::write(&path, "language = \"de\"\n").unwrap();
+        assert_eq!(link_without_target(&path), None);
+    }
+
+    /// The same through a real link: it used to load as plain defaults, and the next save, or a
+    /// deferred one recovered at the start, put a file where the link was.
+    #[test]
+    fn a_config_link_without_its_target_is_never_saved_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let target = dir.path().join("away").join("config.toml");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&target, &path);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&target, &path);
+        // Only Windows may refuse: creating a link there needs Developer Mode or an admin. Anywhere
+        // else a link that can't be made fails the test rather than passing it unexamined.
+        #[cfg(windows)]
+        if made.is_err() {
+            eprintln!("skipped: this Windows account can't create symbolic links");
+            return;
+        }
+        made.unwrap();
+        let s = Settings::load_from(&path);
+        assert!(s.not_loaded.as_deref().is_some_and(|why| why.contains("is a link to") && why.ends_with("which isn't there")), "{:?}", s.not_loaded);
+        assert_eq!(Settings { not_loaded: None, ..s.clone() }, Settings::default());
+        assert_eq!(s.save_to(&path).unwrap_err().code, ErrorCode::BadSettings);
+        assert_eq!(std::fs::read_link(&path).unwrap(), target, "the link is still there");
+        // Edits kept by a busy exit aren't recovered over it either, and they stay kept.
+        Settings { language: "de".into(), ..Settings::default() }.defer_save_to(&path).unwrap();
+        assert_eq!(Settings::recover_pending(&path).unwrap_err().code, ErrorCode::BadSettings);
+        assert!(path.with_extension("pending.toml").exists());
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        // With its target back, the link is read through as any config.toml is.
+        std::fs::create_dir(dir.path().join("away")).unwrap();
+        std::fs::write(&target, "language = \"fr\"\n").unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!((s.language.as_str(), s.not_loaded), ("fr", None));
     }
 }

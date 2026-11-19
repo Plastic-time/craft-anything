@@ -272,3 +272,32 @@ fn a_map_with_broken_mappings_or_section_offsets_keeps_its_sources() {
         assert_eq!(diff["unmatched_sources"], json!([]), "{map}");
     }
 }
+
+/// A section that points at an external map adds no sources, so an otherwise unmatched reference
+/// source may be in the part nobody read: it is uncertain, not confirmed absent.
+#[test]
+fn an_unread_external_section_leaves_its_sources_uncertain() {
+    let graph = graph_with_maps(vec![json!({
+        "version": 3,
+        "sections": [
+            {"offset": {"line": 0, "column": 0}, "map": {"version": 3, "sources": ["a.js"], "mappings": ""}},
+            {"offset": {"line": 10, "column": 0}, "url": "vendor.js.map"}
+        ]
+    })]);
+    let found = &graph.source_maps[0];
+    assert_eq!(found.external_sections, 1, "{found:?}");
+    assert!(!found.sources_truncated && !found.unreadable);
+    assert!(graph.limitations.iter().any(|(key, message)| key == "source_map_external_sections" && message.contains("script-0.js")), "{:?}", graph.limitations);
+
+    let diff = diff_source_and_bundle(&source_graph(&["a.js", "vendor.js"]), &graph, 100);
+    assert_eq!(diff["summary"]["matched"], 1, "{diff}");
+    assert_eq!(diff["unmatched_sources"], json!([]), "{diff}");
+    assert_eq!(diff["uncertain_sources"], json!([{"source": "vendor.js", "reason": "source_map_external_sections"}]));
+    assert_eq!(diff["source_map_external_sections"], true);
+
+    // A graph saved before the field existed reads it as zero: no map claims an unread section.
+    let mut saved = serde_json::to_value(&graph).unwrap();
+    saved["source_maps"][0].as_object_mut().unwrap().remove("external_sections");
+    let restored: AppGraph = serde_json::from_value(saved).unwrap();
+    assert_eq!(restored.source_maps[0].external_sections, 0);
+}

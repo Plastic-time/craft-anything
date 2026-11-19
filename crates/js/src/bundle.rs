@@ -3,7 +3,7 @@
 //! esbuild (`__commonJS` / `__esm` wrappers, minified or not) and browserify. Scope-hoisted
 //! bundles (Rollup, Vite production chunks) have no module boundaries left to recover.
 
-use crate::facts::Key;
+use crate::facts::{Key, static_str};
 use crate::fingerprint::Fingerprint;
 use crate::model::{BundleInfo, BundleModule};
 use crate::util::{LineIndex, sha256_hex, slice};
@@ -107,11 +107,10 @@ impl<'a> Visit<'a> for DepVisitor<'_> {
                 _ => false,
             });
             if is_loader && it.arguments.len() == 1 {
-                let dep = match it.arguments.first().and_then(|a| a.as_expression()) {
-                    Some(Expression::NumericLiteral(x)) => Some(x.value.to_js_string()),
-                    Some(Expression::StringLiteral(s)) => Some(s.value.to_string()),
-                    _ => None,
-                };
+                let dep = it.arguments.first().and_then(|a| a.as_expression()).and_then(|e| match e.get_inner_expression() {
+                    Expression::NumericLiteral(x) => Some(x.value.to_js_string()),
+                    other => static_str(other).map(str::to_string),
+                });
                 if let Some(d) = dep
                     && !self.deps.contains(&d)
                     && self.deps.len() < 4096
@@ -275,6 +274,27 @@ impl<'s> BundleVisitor<'s> {
         good * 10 >= total * 9
     }
 
+    /// Every property is a module factory: a small-arity function under a plain key.
+    fn object_has_factories(o: &ObjectExpression<'_>) -> bool {
+        o.properties
+            .iter()
+            .all(|p| matches!(p, ObjectPropertyKind::ObjectProperty(p) if !p.computed && as_func(&p.value).is_some_and(|f| f.param_count() <= 3)))
+    }
+
+    /// `(g = g || [])` or `(g ||= [])`: how webpack's chunk loading reaches its global array,
+    /// whatever the global is called.
+    fn chunk_global(e: &Expression<'_>) -> bool {
+        let Expression::AssignmentExpression(a) = e.get_inner_expression() else { return false };
+        let empty = |e: &Expression<'_>| matches!(e.get_inner_expression(), Expression::ArrayExpression(x) if x.elements.is_empty());
+        match a.operator {
+            AssignmentOperator::Assign => {
+                matches!(a.right.get_inner_expression(), Expression::LogicalExpression(l) if l.operator == LogicalOperator::Or && empty(&l.right))
+            }
+            AssignmentOperator::LogicalOr => empty(&a.right),
+            _ => false,
+        }
+    }
+
     fn array_is_table(a: &ArrayExpression<'_>) -> bool {
         let funcs = a.elements.iter().filter(|e| e.as_expression().and_then(as_func).is_some_and(|f| f.param_count() <= 3)).count();
         let holes = a.elements.iter().filter(|e| matches!(e, ArrayExpressionElement::Elision(_))).count();
@@ -332,8 +352,7 @@ impl<'s> BundleVisitor<'s> {
                 .filter_map(|p| match p {
                     ObjectPropertyKind::ObjectProperty(p) => match p.value.get_inner_expression() {
                         Expression::NumericLiteral(n) => Some(n.value.to_js_string()),
-                        Expression::StringLiteral(s) => Some(s.value.to_string()),
-                        _ => None,
+                        other => static_str(other).map(str::to_string),
                     },
                     _ => None,
                 })
@@ -411,12 +430,17 @@ impl<'a> Visit<'a> for BundleVisitor<'_> {
                 .iter()
                 .filter_map(|e| match e.as_expression()?.get_inner_expression() {
                     Expression::NumericLiteral(n) => Some(n.value.to_js_string()),
-                    Expression::StringLiteral(s) => Some(s.value.to_string()),
-                    _ => None,
+                    other => static_str(other).map(str::to_string),
                 })
                 .collect();
+            // A table of two or more factories is shape enough; a single one also needs webpack
+            // named in the file or webpack's `(g = g || []).push`, since `queue.push([[1], { a }])`
+            // is ordinary code too.
+            let single_module = |o: &ObjectExpression<'_>| {
+                Self::object_is_table(o) || (o.properties.len() == 1 && (self.webpack_hint || Self::chunk_global(&m.object)) && Self::object_has_factories(o))
+            };
             match payload.elements.get(1).and_then(|e| e.as_expression()).map(|e| e.get_inner_expression()) {
-                Some(Expression::ObjectExpression(o)) if Self::object_is_table(o) || o.properties.len() == 1 => {
+                Some(Expression::ObjectExpression(o)) if single_module(o) => {
                     self.info.chunk_ids.extend(chunk_ids.iter().cloned());
                     self.take_object(o, "webpack-chunk", &chunk_ids);
                     return;

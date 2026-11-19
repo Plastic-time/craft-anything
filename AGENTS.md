@@ -4,7 +4,7 @@ Craft Anything is a native, pure-Rust app that shows anyone how a piece of softw
 websites, phones) with evidence-backed answers, then helps them rebuild it. It ships a desktop app (egui), a CLI and
 an MCP server, all driven by one engine. Display name **Craft Anything**; machine names `craft-anything-*`; bundle id
 `ai.storyteller.craft-anything`. Standards shared across the Crafting Apps live in `../craftrules` (read its
-`AGENTS.md`); follow them. Repos never share code.
+`AGENTS.md`); follow them. Apps do not depend on sibling app crates; reusable code belongs in craft-libs.
 
 **Original work only:** never copy code, scripts, schemas, names, assets or wording from another project, and
 never name other reverse-engineering products in source, docs, UI or commit messages.
@@ -29,7 +29,7 @@ crates/
   ui-egui    L6  The egui interface (Beginner + Experienced). The only crate that may use egui/eframe/winit/rfd.
   testkit        Test helpers and synthetic sample builders
 apps/  craft-anything (desktop) · craft-anything-cli (CLI + `mcp`) · craft-anything-web (browser viewer)
-xtask/ cargo xtask layers | tools [--check] | wasm | secrets [--history] | ci | version [set X.Y.Z]
+xtask/ cargo xtask layers | fmt [--check] | tools [--check] | wasm | secrets [--history] | ci | version [set X.Y.Z]
 ```
 
 Layering is enforced by `cargo xtask layers`. Register new crates in `xtask/src/main.rs`.
@@ -149,7 +149,7 @@ It is part of these rules: read it before your first change (Claude Code loads i
 ## Before you finish
 
 ```sh
-cargo fmt --all
+cargo xtask fmt                     # this workspace's targets, as cargo fmt --all, in batches Windows takes
 cargo build -p craft-anything-cli   # if you touched crates/ai: two of its tests start this helper
 cargo test -p <crates you touched>
 cargo clippy -p <crates> --all-targets -- -D warnings
@@ -168,3 +168,7 @@ the devlog is a local scratch record; anything others need goes in the PR, `docs
 Own target dir (`CARGO_TARGET_DIR=target/agent-<name>`), own files. Shared files (`engine/src/tools/mod.rs`,
 `engine/src/lib.rs`, workspace `Cargo.toml`) get small surgical edits; re-read right before editing. Write manifests
 atomically (temp file outside `crates/`, then `mv`). If someone else's edit breaks the build, wait and retry.
+
+## Shared Craft libraries
+
+Before adding or changing reusable file-format, codec, protocol or UI code, check [craft-libs](https://github.com/storytold/craft-libs) and existing contributor work; reuse its public APIs or extend the appropriate shared library instead of adding an app-local duplicate, keeping app-specific policy and model mapping local and preserving compatibility, security limits and regression coverage.

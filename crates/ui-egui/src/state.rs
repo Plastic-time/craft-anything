@@ -331,6 +331,8 @@ pub enum SettingsTab {
     Builds,
     Plugins,
     Safety,
+    /// The app's name and version.
+    About,
 }
 
 /// A list or view that a tool fills.
@@ -497,6 +499,50 @@ pub struct GameFiles {
     /// What the game is made of (triage's result for its folder).
     #[serde(default)]
     pub profile: Option<Value>,
+    /// The Game files jobs still in flight, by job id. A job a newer pick replaced stays here,
+    /// marked not current, so its failure is logged without being shown.
+    #[serde(default)]
+    pub jobs: BTreeMap<u64, PendingGameJob>,
+}
+
+/// What a Game files job will settle when it finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GameJob {
+    /// `game_archives_list`: the folder's archives; settles `looking`.
+    FolderScan,
+    /// `core_target_triage`: what the game is made of; settles no spinner.
+    Triage,
+    /// An archive listing; settles `loading`.
+    Listing,
+}
+
+/// A Game files job in flight, and whether the screen still waits for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingGameJob {
+    pub kind: GameJob,
+    /// A newer request of the same kind replaces this one: its answer is ignored, and its
+    /// failure is logged but not shown.
+    pub current: bool,
+}
+
+impl GameFiles {
+    /// A job the screen started, whose answer it still waits for.
+    pub fn start(&mut self, job: u64, kind: GameJob) {
+        self.jobs.insert(job, PendingGameJob { kind, current: true });
+    }
+
+    /// A newer request of `kind` replaces the older ones: they may still answer, but the screen
+    /// no longer waits for them.
+    pub fn supersede(&mut self, kind: GameJob) {
+        for pending in self.jobs.values_mut().filter(|pending| pending.kind == kind) {
+            pending.current = false;
+        }
+    }
+
+    /// Take a finished job out, saying whether the screen was still waiting for it.
+    pub fn finish(&mut self, job: u64) -> Option<PendingGameJob> {
+        self.jobs.remove(&job)
+    }
 }
 
 /// A picture waiting for where to be saved.
@@ -516,7 +562,8 @@ pub struct PluginForm {
     pub id: String,
     /// A command (a local server), an https:// address (a remote one) or a `.wasm` file.
     pub place: String,
-    /// Arguments for a command, separated by spaces.
+    /// Arguments for a command, separated by spaces, or a JSON array of strings as other
+    /// clients' configuration files write them (the only way to give an argument with a space).
     pub args: String,
 }
 
@@ -532,7 +579,10 @@ impl PluginForm {
         } else if place.to_ascii_lowercase().ends_with(".wasm") {
             serde_json::json!({"id": id, "wasm": place})
         } else {
-            serde_json::json!({"id": id, "command": place, "args": self.args.split_whitespace().collect::<Vec<_>>()})
+            // A pasted JSON array is the arguments as written; split on spaces it would leave
+            // brackets, quotes and commas in them (#2153).
+            let args = serde_json::from_str::<Vec<String>>(self.args.trim()).unwrap_or_else(|_| self.args.split_whitespace().map(str::to_owned).collect());
+            serde_json::json!({"id": id, "command": place, "args": args})
         })
     }
 }
@@ -603,6 +653,14 @@ mod tests {
         assert_eq!(f("docs", " https://mcp.example.com/mcp ", "ignored"), Some(serde_json::json!({"id": "docs", "url": "https://mcp.example.com/mcp"})));
         assert_eq!(f("fs", "npx", "-y  @scope/server  /tmp"), Some(serde_json::json!({"id": "fs", "command": "npx", "args": ["-y", "@scope/server", "/tmp"]})));
         assert_eq!(f("words", r"C:\plugins\Words.WASM", "ignored"), Some(serde_json::json!({"id": "words", "wasm": r"C:\plugins\Words.WASM"})));
+        // #2153: a JSON array pasted from another client's configuration is the arguments, spaces
+        // and backslashes included; anything else that starts with a bracket is split as before.
+        assert_eq!(
+            f("ls", "server", r#" ["--stdio", "--workspace", "C:\\my project"] "#),
+            Some(serde_json::json!({"id": "ls", "command": "server", "args": ["--stdio", "--workspace", r"C:\my project"]}))
+        );
+        assert_eq!(f("ls", "server", "[]"), Some(serde_json::json!({"id": "ls", "command": "server", "args": []})));
+        assert_eq!(f("ls", "server", "[1, 2] --x"), Some(serde_json::json!({"id": "ls", "command": "server", "args": ["[1,", "2]", "--x"]})));
         assert_eq!(f("", "npx", ""), None);
         assert_eq!(f("x", "  ", ""), None);
     }

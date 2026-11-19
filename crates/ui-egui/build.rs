@@ -1,7 +1,7 @@
 //! Optional craft-fonts (fallbacks for CJK, Arabic, Thai, Hebrew, Devanagari…), following
 //! craft-fonts' `docs/integration.md`. Releases and CI set it.
 //!
-//! Unset `CRAFT_FONTS_DIR` (the default) embeds nothing and the app uses its own DM Sans/JetBrains
+//! Unset `CRAFT_FONTS_DIR` (the default) embeds nothing and the app uses its own Figtree/JetBrains
 //! Mono. Set it to an absolute path of a craft-fonts checkout to embed every font its manifest
 //! lists. A bad path is a warning unless `CRAFT_FONTS_REQUIRED=1`.
 //!
@@ -67,6 +67,9 @@ pub fn plan(dir: Option<OsString>, required: Option<OsString>, wasm: bool) -> Pl
         }
         None => {}
         Some(dir) => match craft_fonts(&dir, wasm, &mut plan.inputs) {
+            Ok(found) if required && found.is_empty() => {
+                plan.error = Some(format!("CRAFT_FONTS_DIR={}: no fonts remain after filtering for this target", dir.display()));
+            }
             Ok(found) => entries = found,
             Err(e) if required => plan.error = Some(format!("CRAFT_FONTS_DIR={}: {e}", dir.display())),
             Err(e) => plan.warning = Some(format!("building without craft-fonts: CRAFT_FONTS_DIR={}: {e}", dir.display())),

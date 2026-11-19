@@ -327,9 +327,10 @@ mod macos {
         if !exe.is_absolute() {
             return Err(ToolError::invalid("executable must be an absolute path"));
         }
-        let lldb = craft_anything_engines::locate("lldb", &ctx.session.settings.engines.tools, &ctx.session.settings.engine_store_dir()).ok_or_else(|| {
-            ToolError::new(ErrorCode::EngineMissing, "lldb was not found.")
-                .with_remediation("Install the macOS command-line developer tools (xcode-select --install).")
+        let lldb = super::super::external_disasm_tools::locate_as(ctx, "lldb", ErrorCode::EngineMissing).map_err(|e| {
+            let fix =
+                format!("{} LLDB comes with the macOS command-line developer tools (xcode-select --install).", e.remediation.as_deref().unwrap_or_default());
+            e.with_remediation(fix)
         })?;
 
         single_line(&p)?;
@@ -735,6 +736,58 @@ mod tests {
             .call("apple_calls_observe", json!({"executable": "/bin/true", "breakpoints": [{"kind": "function", "name": "main"}], "duration_ms": 1}), granted())
             .unwrap_err();
         assert_eq!(err.code, craft_anything_evidence::ErrorCode::BadInput);
+    }
+
+    /// Exercise the real debugger with a program we own. Running this needs the macOS developer
+    /// tools and a host that permits lldb to launch a locally compiled executable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "needs macOS developer tools and permission to launch the debugger"]
+    fn lldb_records_our_probe_and_refuses_a_non_executable() {
+        use craft_anything_evidence::ErrorCode;
+        use craft_anything_platform::process::Process;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("probe.c");
+        let executable = root.path().join("probe");
+        std::fs::write(
+            &source,
+            r#"
+                __attribute__((noinline)) static int alpha(void) { return 1; }
+                __attribute__((noinline)) static int beta(void) { return 2; }
+
+                int main(void) {
+                    int first = alpha();
+                    int second = beta();
+                    return first + second == 3 ? 0 : 1;
+                }
+            "#,
+        )
+        .unwrap();
+        Process::new("xcrun").args(["clang", "-O0", "-g"]).arg(&source).arg("-o").arg(&executable).timeout(Duration::from_secs(30)).run_checked().unwrap();
+
+        let engine = Engine::new(crate::testing::live_session());
+        let observe = |executable: &std::path::Path| {
+            engine.call(
+                "apple_calls_observe",
+                json!({
+                    "executable": executable,
+                    "breakpoints": [
+                        {"kind": "function", "name": "alpha"},
+                        {"kind": "function", "name": "beta"}
+                    ]
+                }),
+                granted(),
+            )
+        };
+        let output = observe(&executable).unwrap().to_json();
+        assert_eq!(output["result"]["hits"], json!([{"function": "alpha"}, {"function": "beta"}]), "{output}");
+        assert_eq!(output["result"]["exit_code"], 0, "{output}");
+
+        let error = observe(&source).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProgramFailed, "{error:?}");
+        assert!(error.remediation.is_some(), "{error:?}");
     }
 
     #[cfg(windows)]

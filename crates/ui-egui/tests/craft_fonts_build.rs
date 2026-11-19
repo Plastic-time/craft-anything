@@ -113,3 +113,75 @@ fn without_a_folder_and_not_required_nothing_is_embedded_and_nothing_is_said() {
         }
     }
 }
+
+#[test]
+fn required_wasm_fonts_must_survive_the_family_and_style_filter() {
+    for entry in [
+        "NanumGothic | Regular | fonts/nanum-gothic/NanumGothic-Regular.ttf | Kore\n",
+        "BIZ UDPGothic | Bold | fonts/biz-ud-pgothic/BIZUDPGothic-Regular.ttf | Jpan\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        checkout(dir.path());
+        std::fs::write(dir.path().join("fonts/manifest.txt"), entry).unwrap();
+        for required in ["1", "true", "false", " 0"] {
+            let p = plan(Some(dir.path().into()), var(required), true);
+            let error = p.error.expect("a nonempty manifest cannot satisfy required fonts if every entry is filtered out");
+            assert!(error.contains("CRAFT_FONTS_DIR=") && error.contains("no fonts remain after filtering"), "{error}");
+            assert!(!error.contains('\n'), "one line, as Cargo reads it");
+            assert_eq!((p.warning, p.source.as_str(), p.inputs.len()), (None, EMPTY_TABLE, 1));
+        }
+        // The same valid entry is embedded natively; the browser allowlist has not widened.
+        let native = plan(Some(dir.path().into()), var("1"), false);
+        assert_eq!((native.error, native.warning, native.inputs.len(), native.source.lines().count()), (None, None, 2, 3));
+        // Optional builds still succeed silently with no selected fonts.
+        for optional in [None, var(""), var("0")] {
+            let p = plan(Some(dir.path().into()), optional, true);
+            assert_eq!((p.error, p.warning, p.source.as_str(), p.inputs.len()), (None, None, EMPTY_TABLE, 1));
+        }
+    }
+}
+
+#[test]
+fn a_required_wasm_manifest_with_only_the_allowed_face_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    checkout(dir.path());
+    std::fs::write(dir.path().join("fonts/manifest.txt"), "BIZ UDPGothic | Regular | fonts/biz-ud-pgothic/BIZUDPGothic-Regular.ttf | Jpan\n").unwrap();
+    let p = plan(Some(dir.path().into()), var("1"), true);
+    assert_eq!((p.error, p.warning, p.inputs.len(), p.source.lines().count()), (None, None, 2, 3));
+    assert!(p.source.contains("BIZ UDPGothic") && !p.source.contains("NanumGothic"));
+    assert!(p.inputs[1].ends_with("BIZUDPGothic-Regular.ttf"));
+}
+
+#[test]
+fn an_empty_wasm_manifest_keeps_its_own_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    checkout(dir.path());
+    std::fs::write(dir.path().join("fonts/manifest.txt"), "# no entries\n\n").unwrap();
+    let p = plan(Some(dir.path().into()), var("1"), true);
+    let error = p.error.expect("an empty manifest cannot satisfy required fonts");
+    assert!(error.contains("manifest.txt") && error.contains("lists no fonts"), "{error}");
+    assert!(!error.contains("after filtering"), "empty input and an empty selection are different: {error}");
+    assert_eq!((p.warning, p.source.as_str()), (None, EMPTY_TABLE));
+    for optional in [None, var(""), var("0")] {
+        let p = plan(Some(dir.path().into()), optional, true);
+        assert_eq!((p.error, p.source.as_str()), (None, EMPTY_TABLE));
+        assert!(p.warning.is_some_and(|w| w.contains("lists no fonts")));
+    }
+}
+
+#[test]
+fn a_missing_selected_font_keeps_its_file_diagnostic_on_both_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    checkout(dir.path());
+    std::fs::remove_file(dir.path().join("fonts/biz-ud-pgothic/BIZUDPGothic-Regular.ttf")).unwrap();
+    for wasm in [false, true] {
+        let p = plan(Some(dir.path().into()), var("1"), wasm);
+        assert!(p.error.is_some_and(|e| e.contains("BIZUDPGothic-Regular.ttf") && !e.contains("after filtering")));
+        assert_eq!((p.warning, p.source.as_str()), (None, EMPTY_TABLE));
+        for optional in [None, var(""), var("0")] {
+            let p = plan(Some(dir.path().into()), optional, wasm);
+            assert_eq!((p.error, p.source.as_str()), (None, EMPTY_TABLE));
+            assert!(p.warning.is_some_and(|w| w.contains("BIZUDPGothic-Regular.ttf")));
+        }
+    }
+}

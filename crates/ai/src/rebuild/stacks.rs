@@ -35,6 +35,11 @@ pub struct Stack {
     /// Its build is a website: a project built with it and nothing to recreate is one.
     #[serde(default)]
     pub site: bool,
+    /// The program its build can't run without (`cargo`), and how to get it.
+    #[serde(default)]
+    pub program: Option<String>,
+    #[serde(default)]
+    pub program_from: Option<String>,
 }
 
 pub use craft_anything_engine::toolchains::{Toolchain, found_in as toolchain_in};
@@ -89,6 +94,13 @@ pub fn words(request: &str) -> String {
 
 pub fn get(name: &str) -> Option<&'static Stack> {
     catalogue().iter().find(|s| s.name == name)
+}
+
+/// The stack's own program (`cargo`) when `have` says this computer doesn't have it, and how to get it.
+pub fn missing_program(stack: &str, have: impl Fn(&str) -> bool) -> Option<(&'static str, &'static str)> {
+    let s = get(stack)?;
+    let program = s.program.as_deref().filter(|p| !have(p))?;
+    Some((program, s.program_from.as_deref().unwrap_or_default()))
 }
 
 /// A stack picked by name: its full name or its engine id, ignoring case (`unity`, `Godot`,
@@ -150,7 +162,7 @@ pub fn steps(stack: &str, editor: Option<&std::path::Path>) -> String {
         ("StandaloneLinux64", "x86_64")
     };
     let editor = editor.map(|e| e.display().to_string()).unwrap_or_default();
-    text.replace("{editor}", &editor).replace("{player}", player).replace("{ext}", ext)
+    craft_anything_platform::text::fill(text, &[("editor", &editor), ("player", player), ("ext", ext)])
 }
 
 #[cfg(test)]
@@ -294,5 +306,17 @@ mod tests {
         let unity = steps("Unity", Some(std::path::Path::new("/ed/Unity")));
         assert!(unity.contains("the editor is /ed/Unity") && !unity.contains('{'), "{unity}");
         assert_eq!(steps("Elm", None), "Use Elm. Create the project in app/ and make sure it builds or runs without errors.");
+    }
+
+    /// An editor path is inserted as it is, even when a folder in it is named like a later
+    /// placeholder (`{player}`, `{ext}`), which chained replacements would fill in turn.
+    #[test]
+    fn an_editor_path_stays_literal() {
+        for path in ["/ed/{ext}/Unity", "/ed/{player}/Unity", "/ed/{player}{ext}/Un{ity"] {
+            let unity = steps("Unity", Some(std::path::Path::new(path)));
+            assert!(unity.contains(&format!("the editor is {path})")), "{unity}");
+            assert!(unity.contains(&format!("`\"{path}\" -batchmode")), "{unity}");
+            assert!(!unity.contains("{player} player") && !unity.contains("Game.{ext}"), "{unity}");
+        }
     }
 }

@@ -16,6 +16,14 @@ pub(crate) fn gap(requests_per_minute: Option<u32>) -> Option<Duration> {
     requests_per_minute.filter(|n| *n > 0).map(|n| Duration::from_secs(60) / n)
 }
 
+/// Waits shorter than this pass without a word in the feed.
+const SAY_WAIT: Duration = Duration::from_secs(2);
+
+/// What the feed says while a request waits for its backend's rate limit.
+fn waiting(backend: &str, wait: Duration) -> String {
+    format!("Waiting {} s before the next request to {backend}, to stay within its requests-per-minute limit…", wait.as_secs_f64().ceil() as u64)
+}
+
 /// A model whose requests start at least `gap` apart.
 pub(crate) struct Paced {
     pub inner: Box<dyn ChatModel>,
@@ -33,6 +41,11 @@ impl ChatModel for Paced {
             next.insert(self.backend.clone(), at + self.gap);
             at
         };
+        // A wait the person would notice is said in the feed, so a paced build doesn't look stuck (#668).
+        let wait = at.saturating_duration_since(Instant::now());
+        if wait >= SAY_WAIT {
+            on_delta(Delta::Status(waiting(&self.backend, wait)));
+        }
         // A stop ends the wait; the model itself then answers it as it does any stopped turn.
         while !stop.is_stopped()
             && let Some(left) = at.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())
@@ -44,6 +57,10 @@ impl ChatModel for Paced {
 
     fn model(&self) -> String {
         self.inner.model()
+    }
+
+    fn context_window(&self) -> Option<crate::window::Window> {
+        self.inner.context_window()
     }
 }
 
@@ -62,13 +79,45 @@ mod tests {
         fn model(&self) -> String {
             "m".into()
         }
+
+        fn context_window(&self) -> Option<crate::window::Window> {
+            Some(crate::window::Window { tokens: 32_768, source: "test" })
+        }
     }
 
-    fn ask(backend: &str, gap: Duration, stop: &Stop) {
+    /// Send one request; what it said in the feed while it waited.
+    fn ask(backend: &str, gap: Duration, stop: &Stop) -> Vec<String> {
         let mut paced = Paced { inner: Box::new(Refuses), backend: backend.into(), gap };
         assert_eq!(paced.model(), "m");
         let req = TurnRequest { system: "", messages: &[], tools: &[], effort: Effort::Low, max_tokens: 1 };
-        assert_eq!(paced.turn(&req, &mut |_| {}, stop).unwrap_err().message, "asked", "the request is still sent");
+        let mut said = Vec::new();
+        let mut on_delta = |d| {
+            if let Delta::Status(text) = d {
+                said.push(text);
+            }
+        };
+        assert_eq!(paced.turn(&req, &mut on_delta, stop).unwrap_err().message, "asked", "the request is still sent");
+        said
+    }
+
+    /// #668: a request held back for its rate limit says so in the feed; one sent at once says nothing.
+    #[test]
+    fn a_wait_for_the_limit_is_said() {
+        assert!(ask("pace-test-said", Duration::from_secs(60), &Stop::default()).is_empty(), "the first goes at once");
+        let stop = Stop::default();
+        stop.stop();
+        assert_eq!(
+            ask("pace-test-said", Duration::from_secs(60), &stop),
+            ["Waiting 60 s before the next request to pace-test-said, to stay within its requests-per-minute limit…"]
+        );
+        assert!(ask("pace-test-short", Duration::from_millis(500), &Stop::default()).is_empty());
+        assert!(ask("pace-test-short", Duration::from_millis(500), &Stop::default()).is_empty(), "half a second isn't worth a line");
+    }
+
+    #[test]
+    fn the_servers_window_is_still_read_through_the_pacing() {
+        let paced = Paced { inner: Box::new(Refuses), backend: "window".into(), gap: Duration::from_secs(60) };
+        assert_eq!(paced.context_window().map(|w| w.tokens), Some(32_768));
     }
 
     #[test]

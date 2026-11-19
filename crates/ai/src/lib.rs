@@ -13,7 +13,7 @@ pub mod config;
 pub mod context;
 pub mod detect;
 mod failure;
-pub mod failure_log;
+pub use craft_anything_engine::failure_log;
 pub mod http;
 pub mod key_tools;
 pub mod keys;
@@ -27,9 +27,11 @@ pub mod prompt;
 pub mod providers;
 pub mod rebuild;
 pub mod ssh;
+pub mod window;
 
+pub use agent::FULL_TOOLS_BUDGET;
 pub use cli_agents::models::{AgentModel, ModelContext};
-pub use config::{AiConfig, BackendEntry, BackendOptions, Price};
+pub use config::{AiConfig, BackendEntry, BackendOptions, Price, ToolList};
 pub use failure::{FailureKind, TurnFailure};
 pub use keys::KeyStore;
 pub use model::Effort;
@@ -49,6 +51,17 @@ pub const SERVER_CONNECT_WAIT: Duration = Duration::from_secs(15);
 /// How long adding a server by its address waits for its models once it's reached: one still
 /// starting, or loading a model before it answers, took longer than the 10 seconds it had (#1429).
 pub const SERVER_ANSWER_WAIT: Duration = Duration::from_secs(60);
+
+/// The chat models a server listed when [`AiHub::add_server`] refused to guess between them
+/// (#1434): empty for any other error.
+pub fn models_to_choose(e: &ToolError) -> Vec<String> {
+    e.details
+        .as_ref()
+        .and_then(|d| d.get("choose_model"))
+        .and_then(serde_json::Value::as_array)
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default()
+}
 
 /// Kinds of backend. See `plan/05-ai-backends.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -193,6 +206,14 @@ fn until_cancelled<T: Send + 'static>(cancel: &CancelToken, ask: impl FnOnce() -
     }
 }
 
+/// A server on this computer or its network (Ollama, LM Studio, one reached over ssh): it costs
+/// nothing and gets the small context budget, and Auto trims its builder's tools by its window. A
+/// remote OpenAI-compatible service has a large context and a bill, as any other cloud API (#374).
+pub fn runs_here(c: &BackendConfig) -> bool {
+    let over_ssh = c.ssh_host.as_deref().is_some_and(|h| !h.trim().is_empty());
+    c.kind == BackendKind::OpenaiCompatible && (over_ssh || c.base_url.as_deref().filter(|b| !b.trim().is_empty()).is_none_or(detect::on_this_network))
+}
+
 fn opencode_go_models_base(base: &str) -> String {
     let base = base.trim_end_matches('/');
     match base.strip_suffix("/openai/v1") {
@@ -201,15 +222,38 @@ fn opencode_go_models_base(base: &str) -> String {
     }
 }
 
-/// The effort an AI thinks at, when it can be chosen (Settings → AI): the Claude API and Claude
-/// Code, which take every level in [`Effort::ALL`]. `None` for the others, which don't use it.
+/// The reasoning levels OpenAI's API takes, which OpenAI-compatible services follow.
+pub const OPENAI_EFFORTS: [Effort; 6] = [Effort::None, Effort::Minimal, Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh];
+
+/// The levels every Gemini model takes through its OpenAI-compatible API: `xhigh` is for one
+/// model only, and `none` can't turn reasoning off on 2.5 Pro, 3 or 4 (Google's OpenAI
+/// compatibility page). shortcut: not per model, so a model's extra level isn't offered;
+/// add a per-model table if someone needs `none` or `xhigh` on Gemini.
+pub const GEMINI_EFFORTS: [Effort; 4] = [Effort::Minimal, Effort::Low, Effort::Medium, Effort::High];
+
+/// The effort levels an AI can be set to (Settings → AI): every Claude level for the Claude API
+/// and Claude Code, OpenAI's for the OpenAI-style APIs (#1813), none for the others.
+pub fn effort_levels(config: &BackendConfig) -> &'static [Effort] {
+    match config.kind {
+        BackendKind::Anthropic => &Effort::ALL,
+        // By adapter, not id: Claude Code is also saved as `claude`.
+        BackendKind::AgentCli if cli_agents::adapter_for(&config.model).ids().contains(&"claude-code") => &Effort::ALL,
+        BackendKind::Gemini => &GEMINI_EFFORTS,
+        BackendKind::Openai | BackendKind::Openrouter | BackendKind::OpenaiCompatible => &OPENAI_EFFORTS,
+        BackendKind::AgentCli => &[],
+    }
+}
+
+/// The effort an AI thinks at: for Claude, the chosen level or high; for an OpenAI-style API,
+/// the chosen level, since not every model there takes one, so nothing is sent until it's
+/// chosen. `None` when no level is sent.
 pub fn effort_in_use(config: &BackendConfig, options: Option<&BackendOptions>) -> Option<Effort> {
-    let claude = match config.kind {
-        BackendKind::Anthropic => true,
-        BackendKind::AgentCli => config.model == "claude-code",
-        _ => false,
-    };
-    claude.then(|| prompt::choose_effort(options.and_then(|o| o.effort)))
+    let chosen = options.and_then(|o| o.effort);
+    match effort_levels(config) {
+        [] => None,
+        levels if levels == Effort::ALL => Some(prompt::choose_effort(chosen)),
+        levels => chosen.filter(|e| levels.contains(e)),
+    }
 }
 
 /// The model an AI uses, when it can be chosen (Settings → AI, #123): an API's own, or the one
@@ -318,6 +362,9 @@ pub enum AgentEvent {
         /// Every prompt token, cached ones included, as agent apps report them.
         input_tokens: u64,
         output_tokens: u64,
+        /// The backend didn't report token counts attributable to this turn.
+        #[serde(default)]
+        tokens_unknown: bool,
         cost_usd: Option<f64>,
         /// `cost_usd` is the agent's own guess at API prices, not what a key was charged: a
         /// subscription may cover the whole of it.
@@ -359,6 +406,11 @@ pub trait Conversation: Send {
     /// Drain new events (non-blocking).
     fn poll(&mut self) -> Vec<AgentEvent>;
     fn answer_consent(&mut self, call_id: &str, allow: bool);
+    /// Refuse a tool without asking anyone: the model is told `why`, not that the person said no.
+    fn refuse_consent(&mut self, call_id: &str, why: &str) {
+        let _ = why;
+        self.answer_consent(call_id, false);
+    }
     fn stop(&mut self);
     fn is_busy(&self) -> bool;
 }
@@ -405,6 +457,10 @@ impl ChatModel for Tunneled {
     fn model(&self) -> String {
         self.inner.model()
     }
+
+    fn context_window(&self) -> Option<window::Window> {
+        self.inner.context_window()
+    }
 }
 
 /// The tools this layer adds to the engine's (rebuild control), for
@@ -440,6 +496,12 @@ impl AiHub {
 
     fn settings_path(&self) -> PathBuf {
         self.settings_path.clone().unwrap_or_else(Settings::path)
+    }
+
+    /// Where a failed model turn writes its log: `logs/` beside the settings file, as an agent
+    /// CLI's failures do (see [`failure_log`]).
+    fn failure_logs(&self) -> Option<PathBuf> {
+        self.settings_path().parent().map(failure_log::dir_in)
     }
 
     /// The current AI configuration. Never blocks on a running tool: if the session is busy the
@@ -527,8 +589,9 @@ impl AiHub {
 
     /// Add an OpenAI-compatible server by its address: Ollama or LM Studio on another computer, or
     /// a hosted service with its key. It's added only when it answers with its models; without a
-    /// model, a chat model it says is loaded (`/api/ps`) is used, else the first one it lists that
-    /// can chat. Returns the model. Anthropic's own
+    /// model, a chat model it says is loaded (`/api/ps`) is used, else the only one it lists that
+    /// can chat; when it lists several, the person chooses ([`models_to_choose`] reads them from
+    /// the error). Returns the model. Anthropic's own
     /// address is added as an Anthropic backend, as its API isn't OpenAI's.
     pub fn add_server(&self, name: &str, address: &str, model: Option<&str>, key: Option<String>) -> Result<String, ToolError> {
         self.add_server_within(name, address, model, key, SERVER_ANSWER_WAIT, &CancelToken::default())
@@ -598,9 +661,25 @@ impl AiHub {
             }
             detect::chat_model(&openai::OpenAi::compatible(name, address, key.clone(), "").loaded_models(Duration::from_secs(5)))
         };
+        // Several chat models and none known to be loaded: which one is in use can't be told, and
+        // the first may be one the server would download (#1434). The person picks; the list
+        // goes in `details.choose_model` for the form to offer.
+        let several = || {
+            let chats = detect::chat_models(&models);
+            if kind == BackendKind::Anthropic || chats.len() < 2 {
+                return Ok(None);
+            }
+            let some = chats.iter().take(5).map(String::as_str).collect::<Vec<_>>().join(", ");
+            let more = if chats.len() > 5 { ", …" } else { "" };
+            Err(ToolError::new(ErrorCode::BadInput, format!("{address} lists {} chat models and doesn't say which one is loaded.", chats.len()))
+                .with_remediation(format!(
+                    "Choose the model to use ({some}{more}), then add it again: asking for one the server hasn't got may start a download."
+                ))
+                .with_details(serde_json::json!({ "choose_model": chats })))
+        };
         let model = match model.map(str::trim).filter(|m| !m.is_empty()) {
             Some(m) => m.to_string(),
-            None => loaded().or_else(|| detect::chat_model(&models)).ok_or_else(|| {
+            None => loaded().map_or_else(several, |m| Ok(Some(m)))?.or_else(|| detect::chat_model(&models)).ok_or_else(|| {
                 let reason = if models.is_empty() { "has no models yet" } else { "doesn't list a model that can chat" };
                 ToolError::new(ErrorCode::NotFound, format!("{address} {reason}."))
                     .with_remediation("Load a chat model on the server first, or enter the name of a chat model you know is available.")
@@ -728,12 +807,16 @@ impl AiHub {
         let Some(b) = cfg.backends.iter_mut().find(|b| b.config.name == name) else { return Ok(false) };
         match b.config.kind {
             BackendKind::AgentCli => {
-                if model_options::supported(&b.config) && b.options.cli_model.as_deref() != Some(model) {
+                // Ask the adapter, not the id: Claude Code is also saved as `claude`, and both, like
+                // Codex, must mean "no model passed" when the choice is the default.
+                let own_default = cli_agents::adapter_for(&b.config.model).offers_own_default();
+                let clear = own_default && model == crate::anthropic::CLAUDE_CODE_DEFAULT;
+                if model_options::supported(&b.config) && (clear || b.options.cli_model.as_deref() != Some(model)) {
                     b.options.cli_context = None;
                     b.options.cli_reasoning_effort = None;
                     b.options.effort = None;
                 }
-                b.options.cli_model = Some(model.to_string());
+                b.options.cli_model = if clear { None } else { Some(model.to_string()) };
             }
             _ => b.config.model = model.to_string(),
         }
@@ -741,17 +824,79 @@ impl AiHub {
         Ok(true)
     }
 
-    /// How hard a backend thinks (`None`: the usual level again). Only the Claude API and Claude
-    /// Code take one ([`effort_in_use`]). Returns false when there was no such backend.
+    /// How hard a backend thinks (`None`: the usual level again). Only the levels in
+    /// [`effort_levels`] are taken. Returns false when there was no such backend.
     pub fn set_effort(&self, name: &str, effort: Option<Effort>) -> Result<bool, ToolError> {
         let mut cfg = self.config_to_change()?;
         let Some(b) = cfg.backends.iter_mut().find(|b| b.config.name == name) else { return Ok(false) };
-        if effort.is_some() && effort_in_use(&b.config, Some(&b.options)).is_none() {
-            return Err(ToolError::invalid(format!("{name} doesn't take an effort level.")).with_remediation("Effort is for the Claude API and Claude Code."));
+        let levels = effort_levels(&b.config);
+        if let Some(e) = effort.filter(|e| !levels.contains(e)) {
+            let fix = match levels {
+                [] => "Effort is for the Claude API, Claude Code and OpenAI-style APIs.".to_string(),
+                levels => format!("Use one of: {}.", levels.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ")),
+            };
+            return Err(ToolError::invalid(format!("{name} doesn't take the effort level {}.", e.as_str())).with_remediation(fix));
         }
         b.options.effort = effort;
         self.save_config(&cfg)?;
         Ok(true)
+    }
+
+    /// The request rate for a configured API backend. No rate means requests are not paced.
+    pub fn requests_per_minute(&self, name: &str) -> Result<Option<u32>, ToolError> {
+        Self::api_request_rate(&self.entry(name)?)
+    }
+
+    /// Change the rate for future conversations. Zero removes the pacing setting.
+    pub fn set_requests_per_minute(&self, name: &str, rate: u32) -> Result<Option<u32>, ToolError> {
+        let mut config = self.config_to_change()?;
+        let entry = config.backends.iter_mut().find(|entry| entry.config.name == name).ok_or_else(|| {
+            ToolError::invalid(format!("No AI backend named {name:?}")).with_remediation("See `craft-anything-cli ai list`, or add one in Settings → AI.")
+        })?;
+        Self::api_request_rate(entry)?;
+        let requested = Some(rate).filter(|rate| *rate != 0);
+        if entry.options.requests_per_minute != requested {
+            entry.options.requests_per_minute = requested;
+            self.save_config(&config)?;
+        }
+        Ok(requested)
+    }
+
+    /// The tools a builder on this API backend is offered, and whether Auto here depends on the
+    /// model's window (a local model) rather than offering every tool (a paid service).
+    pub fn tool_list(&self, name: &str) -> Result<(ToolList, bool), ToolError> {
+        let entry = self.entry(name)?;
+        Self::api_only(&entry, "tool list")?;
+        Ok((entry.options.tools.unwrap_or_default(), runs_here(&entry.config)))
+    }
+
+    /// Change the tools future builders on this backend are offered. Auto is saved as no setting.
+    pub fn set_tool_list(&self, name: &str, list: ToolList) -> Result<ToolList, ToolError> {
+        let mut config = self.config_to_change()?;
+        let entry = config.backends.iter_mut().find(|entry| entry.config.name == name).ok_or_else(|| {
+            ToolError::invalid(format!("No AI backend named {name:?}")).with_remediation("See `craft-anything-cli ai list`, or add one in Settings → AI.")
+        })?;
+        Self::api_only(entry, "tool list")?;
+        let requested = Some(list).filter(|l| *l != ToolList::Auto);
+        if entry.options.tools != requested {
+            entry.options.tools = requested;
+            self.save_config(&config)?;
+        }
+        Ok(list)
+    }
+
+    fn api_only(entry: &BackendEntry, what: &str) -> Result<(), ToolError> {
+        if entry.config.kind == BackendKind::AgentCli {
+            return Err(ToolError::invalid(format!("Agent apps choose their own tools. Set a {what} on an API backend.")));
+        }
+        Ok(())
+    }
+
+    fn api_request_rate(entry: &BackendEntry) -> Result<Option<u32>, ToolError> {
+        if entry.config.kind == BackendKind::AgentCli {
+            return Err(ToolError::invalid("Agent apps send their own requests. Set a request rate on an API backend."));
+        }
+        Ok(entry.options.requests_per_minute.filter(|rate| *rate != 0))
     }
 
     /// The models a backend can be set to: the API's or registered agent's list.
@@ -984,13 +1129,12 @@ impl AiHub {
             _ => None,
         };
         let base = tunneled_base.as_deref().or(base);
-        // A server on this computer or its network (Ollama, LM Studio, one reached over ssh) costs
-        // nothing and gets the small context budget; a remote OpenAI-compatible service has a
-        // large context and a bill, as any other cloud API (#374).
-        let local = c.kind == BackendKind::OpenaiCompatible && base.is_none_or(detect::on_this_network);
+        let local = runs_here(c);
         let limit = stream_limit(&e.options);
+        let sends_effort = effort_in_use(c, Some(&e.options)).is_some();
         let with_limit = |mut o: openai::OpenAi| {
             o.stream_limit = limit;
+            o.sends_effort = sends_effort;
             Box::new(o) as Box<dyn ChatModel>
         };
         let model: Box<dyn ChatModel> = match c.kind {
@@ -1008,6 +1152,8 @@ impl AiHub {
                 let key = self.keys.get(&c.name).or_else(|| go_env_key(base).or_else(|| providers::env_key(base)));
                 let mut o = compatible_client(&c.name, base, key, &c.model, &self.session_id());
                 o.react = e.options.react_fallback.unwrap_or(false);
+                o.asks_window = true;
+                o.on_this_network = local;
                 with_limit(o)
             }
             BackendKind::AgentCli => return Err(ToolError::invalid(format!("{} is an agent app, not an API backend.", c.name))),
@@ -1027,6 +1173,7 @@ impl AiHub {
             effort: e.options.effort,
             max_turns: e.options.max_turns.unwrap_or(agent::DEFAULT_MAX_TURNS),
             context_tokens: e.options.context_tokens.unwrap_or(0),
+            tools: e.options.tools.unwrap_or_default(),
         })
     }
 
@@ -1057,7 +1204,8 @@ impl AiHub {
             }
         }
         let host = Arc::new(EngineHost(self.engine.clone()));
-        let conv = ApiConversation::start(host, chain, LoopConfig { beginner, prices: cfg.prices.clone(), ..LoopConfig::default() })?;
+        let conv =
+            ApiConversation::start(host, chain, LoopConfig { beginner, prices: cfg.prices.clone(), logs: self.failure_logs(), ..LoopConfig::default() })?;
         Ok(Box::new(conv))
     }
 
@@ -1066,38 +1214,35 @@ impl AiHub {
     /// every toolset is enabled, so it can look inside the original with all of them.
     /// `transcript`: where the conversation is kept, and resumed from when it's there in this
     /// mode. `deep` is the run's mode, given by the caller: a tool that starts a build holds the
-    /// session (#1102).
-    pub fn start_builder(&self, entry: &BackendEntry, beginner: bool, transcript: Option<PathBuf>, deep: bool) -> Result<ApiConversation, ToolError> {
-        use craft_anything_engine::Toolset;
-        let toolsets = if deep { self.engine.registry().toolsets() } else { vec![Toolset::Core, Toolset::Build] };
-        self.start_loop(entry, beginner, transcript, deep, &toolsets, true)
-    }
-
-    /// Start the asset extractor: our agent loop with the Build tools and the game archive tools.
-    pub fn start_extractor(&self, entry: &BackendEntry, beginner: bool, transcript: Option<PathBuf>) -> Result<ApiConversation, ToolError> {
-        use craft_anything_engine::Toolset;
-        self.start_loop(entry, beginner, transcript, true, &[Toolset::Core, Toolset::Build, Toolset::Formats], false)
-    }
-
-    /// Start one loop with these toolsets, keeping its transcript and resuming it only in `deep`.
-    fn start_loop(
+    /// session (#1102). `notes`: the build's notes folder, read between tool steps.
+    pub fn start_builder(
         &self,
         entry: &BackendEntry,
         beginner: bool,
         transcript: Option<PathBuf>,
         deep: bool,
-        toolsets: &[craft_anything_engine::Toolset],
-        lean_for_local: bool,
+        notes: Option<PathBuf>,
     ) -> Result<ApiConversation, ToolError> {
+        use craft_anything_engine::Toolset;
+        let toolsets = if deep { self.engine.registry().toolsets() } else { vec![Toolset::Core, Toolset::Build] };
+        self.start_loop(entry, &toolsets, LoopConfig { beginner, transcript, deep, lean_for_local: true, notes, ..LoopConfig::default() })
+    }
+
+    /// Start the asset extractor: our agent loop with the Build tools and the game archive tools.
+    pub fn start_extractor(&self, entry: &BackendEntry, beginner: bool, transcript: Option<PathBuf>) -> Result<ApiConversation, ToolError> {
+        use craft_anything_engine::Toolset;
+        let cfg = LoopConfig { beginner, transcript, deep: true, ..LoopConfig::default() };
+        self.start_loop(entry, &[Toolset::Core, Toolset::Build, Toolset::Formats], cfg)
+    }
+
+    /// Start one loop with these toolsets and `cfg`, which keeps its transcript and resumes it only
+    /// in its mode; the prices and failure logs are the hub's.
+    fn start_loop(&self, entry: &BackendEntry, toolsets: &[craft_anything_engine::Toolset], cfg: LoopConfig) -> Result<ApiConversation, ToolError> {
         let mut slot = self.build_model(entry)?;
         slot.max_turns = slot.max_turns.max(agent::BUILDER_MAX_TURNS);
         let host = Arc::new(EngineHost(self.engine.clone()));
-        ApiConversation::start_with(
-            host,
-            vec![slot],
-            LoopConfig { beginner, prices: self.config().prices.clone(), transcript, deep, lean_for_local, ..LoopConfig::default() },
-            toolsets.iter().copied().collect(),
-        )
+        let cfg = LoopConfig { prices: self.config().prices.clone(), logs: self.failure_logs(), ..cfg };
+        ApiConversation::start_with(host, vec![slot], cfg, toolsets.iter().copied().collect())
     }
 
     /// Start a conversation with whichever backend fills `role` in the crew.
@@ -1187,7 +1332,9 @@ impl AiHub {
             .name("ai-test".into())
             .spawn(move || {
                 let msgs = req_parts();
-                let r = slot.model.turn(&req_owned(&msgs), &mut |_| {}, &stop).map(|r| (r, slot.model.model()));
+                // The level the AI is set to, so the test sends what its conversations will.
+                let req = TurnRequest { effort: prompt::choose_effort(slot.effort), ..req_owned(&msgs) };
+                let r = slot.model.turn(&req, &mut |_| {}, &stop).map(|r| (r, slot.model.model()));
                 let _ = tx.send(r);
             })
             .map_err(|e| ToolError::internal(e.to_string()))?;

@@ -9,6 +9,12 @@ pub(super) fn is_electron_runtime(program: &Path) -> bool {
     program.parent().is_some_and(|dir| dir.join("resources/app.asar").is_file())
 }
 
+/// Whether runtime study may start the program: only one this computer can start. A Windows `.exe`
+/// found in a game's folder on Linux or macOS is studied ([`studies_as_program`]), never started.
+pub(super) fn may_start(program: &Path) -> bool {
+    program.is_file() && is_program(program)
+}
+
 /// The program a later run reopens for its builder: the one the study looked at, in Deep mode on a
 /// local target, when it is still there. None otherwise (Clean room never opens the original).
 pub(super) fn program_to_reopen(target: &TargetRef, kind: &dyn TargetKind, deep: bool) -> Option<PathBuf> {
@@ -111,7 +117,7 @@ impl Worker {
                     )?;
                     notes.push_str(&format!("\n## Ghidra\n\nNo program was found in {}, so Ghidra couldn't be used.\n", path.display()));
                 }
-                if let Some(done) = self.prepare_ghidra(&program) {
+                if let Some(done) = self.prepare_ghidra(&program, &ws.root) {
                     // Deep mode always waits for Ghidra: the builder then decompiles with it straight away.
                     let started = std::time::Instant::now();
                     // One line: the app's progress card shows how long it has been going.
@@ -158,7 +164,7 @@ impl Worker {
                 std::fs::create_dir_all(&capture).map_err(|e| ToolError::io(capture.display(), e))?;
                 let runtime = self.engine.session().settings.runtime_study;
                 let mut console = false;
-                if runtime && program.is_file() && kinds::runs::is_console(&program) {
+                if runtime && may_start(&program) && kinds::runs::is_console(&program) {
                     // A console program draws no window: run it with each input instead.
                     self.step(ws, Step::Study, Status::Inspecting, "Running it with a few inputs to see what it prints…")?;
                     if let Some(section) = self.capture_runs(&program, &capture)? {
@@ -166,7 +172,7 @@ impl Worker {
                         console = true;
                     }
                 }
-                if !console && runtime && program.is_file() && is_program(&program) {
+                if !console && runtime && may_start(&program) {
                     notes.push_str(&self.picture_window(ws, &program, &capture)?);
                 }
                 craft_anything_engine::project::write_atomic(&capture.join("README.md"), notes.as_bytes())?;
@@ -201,6 +207,30 @@ impl Worker {
                 Err(e) => format!("{tool} didn't work: {}\n", e.message),
             });
         }
+        // A recording of the start page's traffic, with the answers it gave, so a rebuilt front end
+        // can be given a stand-in backend (#1838). The run already watches it; this keeps the bodies
+        // within their own cap, with declared secrets and credential headers redacted as
+        // everywhere else. Request bodies are kept too, so two operations sent to one endpoint (a
+        // GraphQL POST, say) can be told apart when the stand-in answers them. A failure is said in
+        // the notes, not fatal to the study.
+        match self.call("web_walkthrough_record", recording_params(url)) {
+            Ok(ToolOutput::Evidence(evidence)) => {
+                let requests = evidence.result.pointer("/network/requests").and_then(Value::as_array).cloned().unwrap_or_default();
+                let file = ws.capture_dir().join(RECORDING);
+                match craft_anything_engine::tools::browser_tools::write_recording(&requests, &file) {
+                    Ok(()) => notes.push_str(&format!(
+                        "\n## A recording of its traffic\n\ncapture/{RECORDING} holds {} request(s) and the answers the site gave while we watched: a stand-in backend built from it (web_standin_build) answers your front end the way the original did.\n",
+                        requests.len()
+                    )),
+                    Err(e) => notes.push_str(&format!("\n## A recording of its traffic\n\nWriting it didn't work: {}\n", e.message)),
+                }
+            }
+            Ok(_) => notes.push_str(&format!("\n## A recording of its traffic\n\nNothing was recorded, so there's no recording in capture/{RECORDING}.\n")),
+            Err(e) => notes.push_str(&format!(
+                "\n## A recording of its traffic\n\nRecording it didn't work ({}), so there's no recording in capture/{RECORDING}.\n",
+                e.message
+            )),
+        }
         craft_anything_engine::project::write_atomic(&ws.capture_dir().join(HOW_IT_WORKS), notes.as_bytes())
     }
 
@@ -216,7 +246,7 @@ impl Worker {
             path.display()
         );
         let runtime = self.engine.session().settings.runtime_study;
-        if runtime && path.is_file() && is_program(path) {
+        if runtime && may_start(path) {
             notes.push_str(&self.picture_window(ws, path, &capture)?);
         }
         craft_anything_engine::project::write_atomic(&capture.join("README.md"), notes.as_bytes())
@@ -295,7 +325,8 @@ impl Worker {
     /// Deep mode with Ghidra installed: run Ghidra's one-time analysis of `program` on its own
     /// thread; the receiver gets its result. The builder's tools share the analysis (waiting for it
     /// rather than starting another), and it carries on if the person pauses, so nothing is lost.
-    pub(super) fn prepare_ghidra(&self, program: &Path) -> Option<Receiver<Result<(), String>>> {
+    /// It stops once `project`'s record is gone: a deleted project needs it no more (#948).
+    pub(super) fn prepare_ghidra(&self, program: &Path, project: &Path) -> Option<Receiver<Result<(), String>>> {
         // A folder (nothing in it recognised as the program) isn't something Ghidra can open.
         if !program.is_file() || is_electron_runtime(program) {
             return None;
@@ -308,6 +339,7 @@ impl Worker {
             s.settings.clone()
         };
         let program = program.to_path_buf();
+        let record = project.join(craft_anything_engine::workspace::MANIFEST);
         let (tx, rx) = std::sync::mpsc::channel();
         let (feed, events, wake) = (self.feed.clone(), self.tx.clone(), self.wake.clone());
         std::thread::Builder::new()
@@ -324,7 +356,10 @@ impl Worker {
                             emit_event(&feed, &events, &wake, RunEvent::Step { step: Step::Study, text: m.to_string() });
                         }
                     };
-                    craft_anything_engine::tools::deep::prepare(&settings, &bytes, &sha, &said)
+                    craft_anything_engine::tools::deep::prepare(&settings, &bytes, &sha, &said, &|| {
+                        // Only a record known to be gone: a drive that can't be read for a moment isn't a delete.
+                        matches!(record.try_exists(), Ok(false))
+                    })
                 });
                 if let Err(e) = &result {
                     log::warn!("Ghidra's analysis of {} failed: {e}", program.display());
@@ -338,6 +373,20 @@ impl Worker {
 
 /// Deep mode's notes on how a website works, in capture/.
 pub(super) const HOW_IT_WORKS: &str = "how-it-works.md";
+/// The start page's traffic as a HAR recording, so `web_standin_build` can replay its answers.
+pub(super) const RECORDING: &str = "original.har";
+
+/// The walkthrough that records a website's start page, exactly as `web_walkthrough_record` takes
+/// it: one `goto` step (the actions are told apart by their `kind`, not by an object around them),
+/// and the bodies a stand-in answers from. Kept here so a test can read it as `WalkthroughParams`.
+pub(super) fn recording_params(url: &str) -> serde_json::Value {
+    json!({
+        "actions": [{"kind": "goto", "url": url, "wait_ms": 10_000}],
+        "capture_network": true,
+        "keep_bodies": {"response_body": true, "request_body": true},
+        "timeout_secs": 120,
+    })
+}
 
 /// The rendered HTML a Deep website capture keeps; a Clean room capture records only what a
 /// visitor sees.

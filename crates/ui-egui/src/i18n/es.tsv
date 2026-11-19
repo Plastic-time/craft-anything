@@ -1,5 +1,6 @@
 # es: traducciones al español (México), registro informal "tú". Licencia MIT OR Apache-2.0.
 # UTF-8: English source<TAB>translation. Keep placeholders and escapes intact.
+Default (its own settings)	Predeterminado (tus propios ajustes)
 OpenCode default	OpenCode predeterminado
 Model default	Modelo predeterminado
 Thinking depth	Profundidad de razonamiento
@@ -304,6 +305,7 @@ Couldn't look through that folder.	No se pudo revisar esa carpeta.
 Couldn't open it.	No se pudo abrir.
 Couldn't open the folder.	No se pudo abrir la carpeta.
 Couldn't open {}: {}	No se pudo abrir {}: {}
+Couldn't save your settings.	No se pudo guardar la configuración.
 Couldn't start a worker thread: {e}	No se pudo iniciar un hilo de trabajo: {e}
 Couldn't start it.	No se pudo iniciar.
 Coverage unknown	Cobertura desconocida
@@ -986,6 +988,7 @@ Saved in	Guardado en
 Saves space: copies the program and code, and shares dependencies and media with the project. A shared file rewritten in place changes here too.	Ahorra espacio: copia el programa y el código, y comparte las dependencias y los medios con el proyecto. Un archivo compartido que se reescriba en el lugar también cambia aquí.
 Say what you want	Di qué quieres
 Say what you want first.	Primero di qué quieres.
+This applies once you choose something to recreate above.	Se aplica cuando eliges arriba algo que recrear.
 Say what you want to make, or drop an app or file on the window to look inside it. Everything runs in Clean room mode unless you switch on Deep.	Di qué quieres hacer, o suelta una app o un archivo en la ventana para mirar dentro. Todo corre en modo Clean room a menos que actives Deep.
 Screenshot	Captura de pantalla
 Screenshot a page	Capturar una página
@@ -1191,6 +1194,7 @@ Use the projects folder	Usar la carpeta de proyectos
 Use this	Usar esto
 Use {name}	Usar {name}
 Value flow	Flujo de valores
+About	Acerca de
 Version	Versión
 Waiting	Esperando
 Waiting for another build to finish: this one starts next.	Esperando a que termine otra construcción: esta empieza enseguida.
@@ -1366,6 +1370,7 @@ your files there are the app, edited in place	tus archivos de ahí son la app, e
 {name} builds what you make; answers come from {brain}.	{name} construye lo que haces; las respuestas vienen de {brain}.
 {name} can't be attached: a message takes pictures up to 20 MB.	No se puede adjuntar {name}: un mensaje admite imágenes de hasta 20 MB.
 {name} can't be attached: it isn't a PNG, JPEG, GIF or WebP picture.	No se puede adjuntar {name}: no es una imagen PNG, JPEG, GIF o WebP.
+{name} can't be kept to only reading, so it isn't asked questions. Ask with Claude Code, or with an AI that has an API key.	{name} no se puede limitar a solo leer, así que no se le hacen preguntas. Pregunta con Claude Code o con una IA que tenga clave de API.
 {name} is ready	{name} está listo
 {name} is ready.	{name} está listo.
 {name} isn't available yet in this build.	{name} aún no está disponible en esta construcción.
@@ -1445,6 +1450,7 @@ Zoom	Zoom
 Bring all to front	Traer todo al frente
 Drag to give the plan more or less room; double-click to reset	Arrastra para darle al plan más o menos espacio; doble clic para restablecer
 Copy the message	Copiar el mensaje
+Copy the version	Copiar la versión
 Choose what the builder's approvals get	Elegir qué reciben las aprobaciones del constructor
 Reading the web	Leer la web
 Other commands	Otros comandos
@@ -1488,3 +1494,11 @@ Updated to {version}.	Actualizado a {version}.
 Use Releases or your package manager to update this installation.	Usa Versiones o tu gestor de paquetes para actualizar esta instalación.
 You're up to date.	Tienes la última versión.
 {version} is available.	{version} está disponible.
+Forget a website sign-in	Olvidar el inicio de sesión de un sitio web
+Sign in to a website	Iniciar sesión en un sitio web
+Some shared files could not be hard-linked and were copied instead ({size}).	Algunos archivos compartidos no se pudieron enlazar de forma rígida y se copiaron ({size}).
+This server lists several chat models. Choose one:	Este servidor ofrece varios modelos de chat. Elige uno:
+Choose a model	Elige un modelo
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.

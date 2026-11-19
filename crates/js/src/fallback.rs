@@ -7,39 +7,55 @@ use crate::lex::{TokKind, Token, string_value, unescape};
 use crate::model::*;
 use crate::util::{LineIndex, push_unique};
 
+/// Facts from the token stream, for sources the parser refused or failed on: imports, IPC calls,
+/// URLs, source-map comments and banners, with the same list caps as the syntax-tree pass.
 pub(crate) fn facts_from_tokens(tokens: &[Token<'_>], lines: &LineIndex) -> ModuleFacts {
     let mut f = ModuleFacts { mode: ParseMode::Lexer, ..Default::default() };
     let sig: Vec<&Token<'_>> = tokens.iter().filter(|t| t.kind != TokKind::Comment).collect();
     let at = |i: usize| sig.get(i).map(|t| (t.kind, t.text));
     let mut seen = std::collections::HashSet::new();
+    let mut endpoint_urls = std::collections::HashSet::new();
     for (i, t) in sig.iter().enumerate() {
         let off = u32::try_from(t.offset).unwrap_or(u32::MAX);
         let line = lines.line(off);
         api_token(&mut f, &sig, i, off, line);
         match (t.kind, t.text) {
             (TokKind::Ident, "require" | "import") if at(i + 1) == Some((TokKind::Punct, "(")) => {
+                let dynamic = t.text == "import";
+                if dynamic && i.checked_sub(1).and_then(at).is_some_and(|p| matches!(p, (TokKind::Punct, "." | "?."))) {
+                    continue;
+                }
+                let after_specifier = at(i + 3);
                 if let Some((TokKind::Str, s)) = at(i + 2)
-                    && at(i + 3) == Some((TokKind::Punct, ")"))
-                    && f.imports.len() < crate::facts::MAX_LIST
+                    && (after_specifier == Some((TokKind::Punct, ")")) || (dynamic && after_specifier == Some((TokKind::Punct, ","))))
                 {
-                    let kind = if t.text == "require" { "require" } else { "dynamic-import" };
-                    let spec = string_value(s);
-                    if spec.ends_with(".node") {
-                        push_unique(&mut f.native_modules, spec.clone(), 1000);
-                    }
-                    f.imports.push(ImportRef { kind: kind.into(), specifier: spec, literal: true, names: Vec::new(), line, offset: off });
+                    let kind = if dynamic { "dynamic-import" } else { "require" };
+                    add_import(&mut f, kind, string_value(s), line, off);
+                }
+            }
+            (TokKind::Ident, "import")
+                if matches!(at(i + 1), Some((TokKind::Str, _))) && (i == 0 || !matches!(at(i - 1), Some((TokKind::Punct, "." | "?.")))) =>
+            {
+                if let Some((TokKind::Str, s)) = at(i + 1) {
+                    add_import(&mut f, "import", string_value(s), line, off);
                 }
             }
             (TokKind::Ident, "from") => {
-                if let Some((TokKind::Str, s)) = at(i + 1)
-                    && f.imports.len() < crate::facts::MAX_LIST
-                {
-                    f.imports.push(ImportRef { kind: "import".into(), specifier: string_value(s), literal: true, names: Vec::new(), line, offset: off });
+                if let Some((TokKind::Str, s)) = at(i + 1) {
+                    add_import(&mut f, "import", string_value(s), line, off);
                 }
             }
             (TokKind::Ident, "fetch") if at(i + 1) == Some((TokKind::Punct, "(")) => {
                 if let Some((TokKind::Str, s)) = at(i + 2) {
-                    f.endpoints.push(Endpoint { api: "fetch".into(), method: None, url: string_value(s), literal: true, line, offset: off, function: None });
+                    if f.endpoints.len() < crate::facts::MAX_LIST {
+                        let url = string_value(s);
+                        if url.len() <= crate::facts::MAX_STRING_LEN {
+                            endpoint_urls.insert(url.clone());
+                        }
+                        f.endpoints.push(Endpoint { api: "fetch".into(), method: None, url, literal: true, line, offset: off, function: None });
+                    } else {
+                        mark_truncated(&mut f, "endpoints");
+                    }
                 }
             }
             (TokKind::Ident, method @ ("handle" | "handleOnce" | "invoke" | "on" | "once" | "send" | "sendSync" | "exposeInMainWorld"))
@@ -49,7 +65,11 @@ pub(crate) fn facts_from_tokens(tokens: &[Token<'_>], lines: &LineIndex) -> Modu
                 let Some((TokKind::Str, s)) = at(i + 2) else { continue };
                 let channel = string_value(s);
                 if method == "exposeInMainWorld" {
-                    f.exposed.push(Exposed { method: method.into(), key: Some(channel), members: Vec::new(), line, offset: off });
+                    if f.exposed.len() < crate::facts::MAX_LIST {
+                        f.exposed.push(Exposed { method: method.into(), key: Some(channel), members: Vec::new(), line, offset: off });
+                    } else {
+                        mark_truncated(&mut f, "exposed");
+                    }
                     continue;
                 }
                 let side = match (recv, method) {
@@ -59,16 +79,32 @@ pub(crate) fn facts_from_tokens(tokens: &[Token<'_>], lines: &LineIndex) -> Modu
                 };
                 if f.ipc.len() < crate::facts::MAX_LIST {
                     f.ipc.push(IpcUse { side: side.into(), method: method.into(), channel: Some(channel), line, offset: off, function: None, handler: None });
+                } else {
+                    mark_truncated(&mut f, "ipc");
                 }
             }
             (TokKind::Str, raw) => {
                 let v = string_value(raw);
-                if v.len() <= crate::facts::MAX_STRING_LEN && !v.is_empty() && f.strings.len() < crate::facts::MAX_STRINGS && seen.insert(v.clone()) {
-                    let lower = v.get(..8).unwrap_or(&v).to_ascii_lowercase();
-                    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("ws://") || lower.starts_with("wss://") {
-                        f.endpoints.push(Endpoint { api: "literal".into(), method: None, url: v.clone(), literal: true, line, offset: off, function: None });
+                if !v.is_empty() && v.len() <= crate::facts::MAX_STRING_LEN {
+                    if !seen.contains(&v) {
+                        if f.strings.len() < crate::facts::MAX_STRINGS {
+                            seen.insert(v.clone());
+                            f.strings.push(v.clone());
+                        } else {
+                            mark_truncated(&mut f, "strings");
+                        }
                     }
-                    f.strings.push(v);
+                    let lower = v.get(..8).unwrap_or(&v).to_ascii_lowercase();
+                    if (lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("ws://") || lower.starts_with("wss://"))
+                        && !endpoint_urls.contains(&v)
+                    {
+                        if f.endpoints.len() < crate::facts::MAX_LIST {
+                            endpoint_urls.insert(v.clone());
+                            f.endpoints.push(Endpoint { api: "literal".into(), method: None, url: v, literal: true, line, offset: off, function: None });
+                        } else {
+                            mark_truncated(&mut f, "endpoints");
+                        }
+                    }
                 }
             }
             (TokKind::Ident, name) => {
@@ -124,6 +160,11 @@ fn api_token(f: &mut ModuleFacts, sig: &[&Token<'_>], i: usize, off: u32, line: 
         }
         TokKind::Ident => {
             let Some(kind) = api_ops::client_hook(t.text) else { return };
+            // A hook property can be saved or passed around without calling the procedure.
+            let called = at(i + 1) == Some((TokKind::Punct, "(")) || (at(i + 1) == Some((TokKind::Punct, "?.")) && at(i + 2) == Some((TokKind::Punct, "(")));
+            if !called {
+                return;
+            }
             // Back along `a.b.c.useQuery`, as far as plain names go.
             let mut path: Vec<&str> = Vec::new();
             let mut j = i;
@@ -156,10 +197,28 @@ fn api_token(f: &mut ModuleFacts, sig: &[&Token<'_>], i: usize, off: u32, line: 
             function: None,
         };
         if !api_ops::push_operation(&mut f.api_operations, op, crate::facts::MAX_LIST) {
-            if !f.truncated.iter().any(|x| x == "api_operations") {
-                f.truncated.push("api_operations".into());
-            }
+            mark_truncated(f, "api_operations");
             return;
         }
+    }
+}
+
+/// Record an import as the syntax-tree pass does: past the list cap it is dropped and `imports`
+/// is marked truncated, and a `.node` specifier is also a native module.
+fn add_import(f: &mut ModuleFacts, kind: &str, specifier: String, line: u32, offset: u32) {
+    if f.imports.len() >= crate::facts::MAX_LIST {
+        mark_truncated(f, "imports");
+        return;
+    }
+    if specifier.ends_with(".node") {
+        push_unique(&mut f.native_modules, specifier.clone(), crate::facts::MAX_LIST);
+    }
+    f.imports.push(ImportRef { kind: kind.into(), specifier, literal: true, names: Vec::new(), line, offset });
+}
+
+/// Note that `list` was cut at a limit, once.
+fn mark_truncated(f: &mut ModuleFacts, list: &str) {
+    if !f.truncated.iter().any(|x| x == list) {
+        f.truncated.push(list.into());
     }
 }

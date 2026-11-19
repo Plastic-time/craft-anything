@@ -19,6 +19,8 @@ use std::time::Duration;
 
 /// Largest file one read returns (the rest is paged with offset/limit).
 const MAX_READ: usize = 256 * 1024;
+/// Largest project file a read holds in memory at once (16 MiB); larger files are refused.
+const MAX_READ_FILE: u64 = 16 * 1024 * 1024;
 /// Largest file a write may create.
 const MAX_WRITE: usize = 8 * 1024 * 1024;
 /// Most entries one listing returns.
@@ -207,6 +209,34 @@ fn in_project(ws: &Workspace, rel: &str) -> Result<PathBuf, ToolError> {
     )
 }
 
+/// Resolve `rel` inside `ws`, falling back to `ws.app_dir()` when `rel` is missing at `ws.root`
+/// and doesn't already start with `app/`. Commands via `build_command_run` execute inside `app/`,
+/// so compiler diagnostics report paths relative to `app/` rather than the workspace root.
+fn in_project_or_app(ws: &Workspace, rel: &str, for_write: bool) -> Result<PathBuf, ToolError> {
+    let path = in_project(ws, rel)?;
+    if ws.manifest.app_in_root || path.exists() || rel.starts_with(['/', '\\']) {
+        return Ok(path);
+    }
+    let starts_with_app = inside(&ws.app_dir(), &path) || rel.split(['/', '\\']).find(|c| !c.is_empty() && *c != ".").is_none_or(|first| first == "app");
+    if starts_with_app {
+        return Ok(path);
+    }
+    let Some(app_path) = resolve(&ws.app_dir(), rel).filter(|p| really_inside(&ws.app_dir(), p) && really_inside(&ws.root, p)) else {
+        return Ok(path);
+    };
+    if app_path.exists() {
+        return Ok(app_path);
+    }
+    if for_write {
+        let app_parent_exists = app_path.parent().is_some_and(|parent| parent != ws.app_dir() && parent.is_dir());
+        let root_parent_exists = path.parent().is_some_and(|parent| parent != ws.root && parent.is_dir());
+        if app_parent_exists && !root_parent_exists {
+            return Ok(app_path);
+        }
+    }
+    Ok(path)
+}
+
 fn shown(ws: &Workspace, p: &Path) -> String {
     let root = resolve(&ws.root, ".").unwrap_or_else(|| ws.root.clone());
     let rel = p.strip_prefix(&root).unwrap_or(p);
@@ -221,7 +251,7 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     let p: ListParams = parse_params(params)?;
     let ws = workspace(ctx)?;
     let default = if ws.manifest.app_in_root { "." } else { "app" };
-    let root = in_project(&ws, p.path.as_deref().unwrap_or(default))?;
+    let root = in_project_or_app(&ws, p.path.as_deref().unwrap_or(default), false)?;
     // Our records are hidden from a listing of the project, but a listing of one of them (the
     // builder is told to read capture/ and reference/) shows what is in it.
     let listing_own = ws.is_own_record(&root);
@@ -261,11 +291,34 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     Ok(ToolOutput::Value(json!({"root": shown(&ws, &root), "entries": entries, "truncated": truncated})))
 }
 
+/// Read a project file a builder can hold in memory, with a plain error for one over the cap.
+fn read_file_for_builder(path: &Path, shown: &str) -> Result<Vec<u8>, ToolError> {
+    capped_for_builder(path, shown, "read", "Read a smaller file, or use a build command to print the part you need.")
+}
+
+/// Read a project file as text for an edit, refusing one over the same cap before it is loaded.
+fn read_text_for_edit(path: &Path, shown: &str) -> Result<String, ToolError> {
+    let bytes = capped_for_builder(path, shown, "edit", "Edit a smaller file, or use a build command to change it.")?;
+    String::from_utf8(bytes).map_err(|e| ToolError::io(path.display(), std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
+/// Read a whole project file with the builder's memory cap, so no path loads an oversized file.
+fn capped_for_builder(path: &Path, shown: &str, action: &str, remedy: &str) -> Result<Vec<u8>, ToolError> {
+    craft_anything_platform::fs::read_file_capped(path, MAX_READ_FILE).map_err(|e| {
+        if e.code == ErrorCode::OverLimit {
+            ToolError::new(ErrorCode::OverLimit, format!("{shown} is larger than the {} MB a builder can {action} at once.", MAX_READ_FILE / (1024 * 1024)))
+                .with_remediation(remedy)
+        } else {
+            e
+        }
+    })
+}
+
 fn build_file_read(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: ReadParams = parse_params(params)?;
     let ws = workspace(ctx)?;
-    let path = in_project(&ws, &p.path)?;
-    let bytes = std::fs::read(&path).map_err(|e| ToolError::io(path.display(), e))?;
+    let path = in_project_or_app(&ws, &p.path, false)?;
+    let bytes = read_file_for_builder(&path, &p.path)?;
     if bytes.iter().take(8000).any(|b| *b == 0) {
         return Err(ToolError::invalid(format!("{} is a binary file.", p.path)).with_remediation("Read text files; look at pictures with your own viewer."));
     }
@@ -286,7 +339,7 @@ fn build_file_read(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolE
         out.push('\n');
         n += 1;
     }
-    let mut v = json!({"path": p.path, "offset": start, "lines": n, "total_lines": lines.len(), "more": start + n < lines.len(), "text": out});
+    let mut v = json!({"path": shown(&ws, &path), "offset": start, "lines": n, "total_lines": lines.len(), "more": start + n < lines.len(), "text": out});
     if cut {
         v["note"] = json!(format!("Line {} is longer than {} KiB, so only its start is shown.", start + 1, MAX_READ / 1024));
     }
@@ -307,7 +360,7 @@ fn write_checked(ctx: &mut Ctx<'_>, path: &Path, content: &str) -> Result<(), To
 fn build_file_write(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: WriteParams = parse_params(params)?;
     let ws = workspace(ctx)?;
-    let path = in_project(&ws, &p.path)?;
+    let path = in_project_or_app(&ws, &p.path, true)?;
     write_checked(ctx, &path, &p.content)?;
     let mut out = json!({"written": shown(&ws, &path), "bytes": p.content.len()});
     // A model that leaves out `app/` would otherwise build beside the app, where no check looks.
@@ -320,8 +373,8 @@ fn build_file_write(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
 fn build_file_edit(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: EditParams = parse_params(params)?;
     let ws = workspace(ctx)?;
-    let path = in_project(&ws, &p.path)?;
-    let text = std::fs::read_to_string(&path).map_err(|e| ToolError::io(path.display(), e))?;
+    let path = in_project_or_app(&ws, &p.path, false)?;
+    let text = read_text_for_edit(&path, &p.path)?;
     let count = if p.old_text.is_empty() { 0 } else { text.matches(p.old_text.as_str()).count() };
     let new = match (count, p.replace_all) {
         (0, _) => return Err(ToolError::invalid(format!("old_text isn't in {}.", p.path)).with_remediation("Read the file again and copy the text exactly.")),
@@ -423,6 +476,57 @@ mod tests {
         assert!(call(&e, "build_file_edit", json!({"path": "app/src/main.rs", "old_text": "nope", "new_text": "x"})).is_err());
         assert!(call(&e, "build_file_read", json!({"path": "../../etc/passwd"})).is_err());
         assert!(call(&e, "build_file_write", json!({"path": "../outside.txt", "content": "x"})).is_err());
+    }
+
+    /// A project file over the read cap is refused instead of being read whole; a file exactly at
+    /// the cap still reads, with only its first page returned.
+    #[test]
+    fn a_file_over_the_read_cap_is_refused() {
+        let (_d, ws, e) = building();
+        std::fs::create_dir_all(ws.app_dir()).unwrap();
+        let cap = MAX_READ_FILE as usize;
+        std::fs::write(ws.app_dir().join("over-cap.txt"), "a".repeat(cap + 1)).unwrap();
+        let err = call(&e, "build_file_read", json!({"path": "app/over-cap.txt"})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::OverLimit);
+        assert!(err.message.contains("16 MB"), "{err:?}");
+        std::fs::write(ws.app_dir().join("at-cap.txt"), "a".repeat(cap)).unwrap();
+        let ok = call(&e, "build_file_read", json!({"path": "app/at-cap.txt"})).unwrap();
+        assert_eq!((ok["lines"].as_u64(), ok["text"].as_str().map(str::len)), (Some(1), Some(MAX_READ + 1)));
+    }
+
+    /// An edit refuses a project file over the 16 MiB cap before reading it, and changes nothing.
+    #[test]
+    fn a_file_over_the_edit_cap_is_refused_and_left_unchanged() {
+        let (_d, ws, e) = building();
+        std::fs::create_dir_all(ws.app_dir()).unwrap();
+        let original = format!("old{}", "a".repeat(MAX_READ_FILE as usize));
+        let path = ws.app_dir().join("over-cap.txt");
+        std::fs::write(&path, &original).unwrap();
+        let err = call(&e, "build_file_edit", json!({"path": "app/over-cap.txt", "old_text": "old", "new_text": "new"})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::OverLimit);
+        assert!(err.message.contains("16 MB"), "{err:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes(), "a refused edit must not change the file");
+    }
+
+    /// A file exactly at the edit cap still reads, and an edit that fits the write cap is saved.
+    #[test]
+    fn a_file_at_the_edit_cap_can_be_edited() {
+        let (_d, ws, e) = building();
+        std::fs::create_dir_all(ws.app_dir()).unwrap();
+        let cap = MAX_READ_FILE as usize;
+        let head = "start\n";
+        let mut original = String::with_capacity(cap);
+        original.push_str(head);
+        original.push_str(&"a".repeat(cap - head.len()));
+        let path = ws.app_dir().join("at-cap.txt");
+        std::fs::write(&path, &original).unwrap();
+        // Long enough that replacing it brings the file under the 8 MB a write may hold.
+        let old = "a".repeat(9 * 1024 * 1024);
+        let out = call(&e, "build_file_edit", json!({"path": "app/at-cap.txt", "old_text": old, "new_text": "b"})).unwrap();
+        assert_eq!(out["replaced"], 1);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("start\nb"), "{:.20}", saved);
+        assert_eq!(saved.len(), cap - old.len() + 1);
     }
 
     /// "Work on my project" keeps the app in the project root: the default listing must be that
@@ -626,5 +730,50 @@ mod tests {
         let e = Engine::new(crate::testing::session());
         let err = call(&e, "build_files_list", json!({})).unwrap_err();
         assert_eq!(err.code, ErrorCode::FeatureMissing);
+    }
+
+    #[test]
+    fn app_relative_paths_fall_back_to_app_dir() {
+        let (_d, ws, e) = building();
+        call(&e, "build_file_write", json!({"path": "app/crates/example/src/board.rs", "content": "pub struct Board;\n"})).unwrap();
+
+        // Compiler errors from build_command_run emit paths relative to app/ (without app/ prefix).
+        let r = call(&e, "build_file_read", json!({"path": "crates/example/src/board.rs"})).unwrap();
+        assert_eq!(r["path"], "app/crates/example/src/board.rs");
+        assert_eq!(r["text"], "pub struct Board;\n");
+
+        // build_file_edit falls back to the existing file in app/.
+        let ed = call(&e, "build_file_edit", json!({"path": "crates/example/src/board.rs", "old_text": "Board", "new_text": "CanvasBoard"})).unwrap();
+        assert_eq!(ed["edited"], "app/crates/example/src/board.rs");
+        assert!(std::fs::read_to_string(ws.app_dir().join("crates/example/src/board.rs")).unwrap().contains("CanvasBoard"));
+
+        // build_files_list falls back when listing an app-relative subdirectory.
+        let list = call(&e, "build_files_list", json!({"path": "crates/example"})).unwrap();
+        assert_eq!(list["root"], "app/crates/example");
+        assert!(list["entries"].to_string().contains("app/crates/example/src/board.rs"), "{list}");
+
+        // build_file_write writes inside app/ when the parent folder already exists in app/ and not at root.
+        let wr = call(&e, "build_file_write", json!({"path": "crates/example/src/new_mod.rs", "content": "pub struct NewMod;\n"})).unwrap();
+        assert_eq!((wr["written"].as_str(), wr.get("note")), (Some("app/crates/example/src/new_mod.rs"), None));
+        assert!(ws.app_dir().join("crates/example/src/new_mod.rs").is_file());
+        assert!(!ws.root.join("crates/example/src/new_mod.rs").exists());
+
+        // Overwriting an existing file via build_file_write without app/ also targets app/.
+        let ov = call(&e, "build_file_write", json!({"path": "crates/example/src/board.rs", "content": "pub struct Updated;\n"})).unwrap();
+        assert_eq!(ov["written"], "app/crates/example/src/board.rs");
+
+        // Root-level stray file without an app-specific parent still writes to root with the note.
+        let stray = call(&e, "build_file_write", json!({"path": "README.md", "content": "hi"})).unwrap();
+        assert!(stray["note"].as_str().unwrap().contains("outside app/"), "{stray}");
+
+        // Explicit app/ paths (including ./app/...) must never fall back into a nested app/app/.
+        call(&e, "build_file_write", json!({"path": "app/app/page.tsx", "content": "nested"})).unwrap();
+        let err_plain = call(&e, "build_file_read", json!({"path": "app/page.tsx"})).unwrap_err();
+        let err_dot = call(&e, "build_file_read", json!({"path": "./app/page.tsx"})).unwrap_err();
+        assert_eq!(err_plain.code, err_dot.code);
+        let written = call(&e, "build_file_write", json!({"path": "./app/page.tsx", "content": "top"})).unwrap();
+        assert_eq!(written["written"], "app/page.tsx");
+        assert_eq!(std::fs::read_to_string(ws.app_dir().join("app/page.tsx")).unwrap(), "nested");
+        assert_eq!(std::fs::read_to_string(ws.app_dir().join("page.tsx")).unwrap(), "top");
     }
 }

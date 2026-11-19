@@ -108,11 +108,11 @@ fn config(settings: &Settings, language_override: Option<String>) -> Option<(ghi
 
 /// Analyse a program with Ghidra ahead of time (Deep mode), so the builder's first decompile opens
 /// a saved analysis instead of waiting hours for one. Shares the analysis with any other process
-/// doing the same. `progress` gets a line now and then.
-pub fn prepare(settings: &Settings, bytes: &[u8], sha256: &str, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<(), String> {
+/// doing the same. `progress` gets a line now and then; `stop` ends it early (its project is gone).
+pub fn prepare(settings: &Settings, bytes: &[u8], sha256: &str, progress: &(dyn Fn(&str) + Send + Sync), stop: &ghidra::Cancel<'_>) -> Result<(), String> {
     let (cfg, digest) = config(settings, None).ok_or_else(|| NOT_INSTALLED.to_string())?;
     ANALYSING.fetch_add(1, Ordering::SeqCst);
-    let closing = || CLOSING.load(Ordering::SeqCst);
+    let closing = || CLOSING.load(Ordering::SeqCst) || stop();
     let result = ghidra::analyse(&cfg, bytes, sha256, &digest, &closing, &|_, m: &str| progress(m)).map(|_| ()).map_err(|e| e.to_string());
     ANALYSING.fetch_sub(1, Ordering::SeqCst);
     result

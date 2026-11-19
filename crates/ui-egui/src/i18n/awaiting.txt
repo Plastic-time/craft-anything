@@ -2,3 +2,12 @@
 # One per line, written as in a catalog's first column (\n for a line break).
 # `cargo xtask i18n-coverage` lets these be missing from the catalogs, and fails once a string
 # here is translated in every catalog or no longer shown: the translation PR takes it out.
+Requests per minute
+Set request rate
+Set to 0 for no limit.
+Enter a whole number, or 0 for no limit.
+Builder's tools
+Auto: building tools only below a 64k window, every tool from there.
+Auto: every tool, as this AI is a paid service.
+Change a builder's tools
+That folder's name has characters Craft Anything can't read. Pick another folder.

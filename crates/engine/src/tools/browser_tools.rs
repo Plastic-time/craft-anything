@@ -159,7 +159,7 @@ pub(crate) fn resolve_browser(
     no_sandbox: bool,
     dl: &Deadline,
 ) -> Result<Browser, ToolError> {
-    let opts = LaunchOptions { allow_launch: launch, headless, no_sandbox, startup_secs: 30 };
+    let opts = LaunchOptions { allow_launch: launch, headless, no_sandbox, ..LaunchOptions::default() };
     Browser::resolve(ctx, endpoint, &opts, dl)
 }
 
@@ -315,6 +315,8 @@ const SCRIPT_RECORD_CAP: usize = 50_000;
 const SCRIPT_META_BUDGET: usize = 8 << 20;
 const SOURCE_TEXT_BUDGET: usize = 32 << 20;
 const NETWORK_RECORD_CAP: usize = 20_000;
+/// JSON responses read for an outline; counts JSON responses, not all requests (#1811).
+const JSON_OUTLINE_CAP: usize = 200;
 
 /// Enable the needed domains, observe for `watch_ms`, and build a data-minimised capture.
 pub(crate) fn capture_page(
@@ -343,6 +345,8 @@ pub(crate) fn capture_page(
     let window = window_deadline(ctx, watch_ms, dl);
     client.pump_until(&window)?;
     let events = client.take_events();
+    let mut dialogs = web_common::dialogs_from(&events);
+    web_common::redact_dialogs(&mut dialogs, secrets);
 
     // Frame tree → origins.
     let frames = client.call("Page.getFrameTree", json!({}), None, dl).unwrap_or(Value::Null);
@@ -395,6 +399,7 @@ pub(crate) fn capture_page(
         "watch_ms": watch_ms,
         "dropped_events": dropped,
         "secret_redactions": secrets.redactions,
+        "dialogs": dialogs,
     });
     Ok(PageCapture { result, scripts, dropped })
 }
@@ -567,17 +572,24 @@ pub(crate) fn collect_network(
             _ => {}
         }
     }
-    // Optional JSON body outlines for JSON responses.
+    // Optional JSON body outlines for JSON responses. The cap counts JSON responses, not every
+    // request: a page that loads its data after 230 scripts, styles and telemetry calls still got
+    // outlines for what mattered (#1811).
+    let mut json = None;
     if want_body_outlines {
-        let ids: Vec<String> = order.iter().take(200).cloned().collect();
-        for id in ids {
+        let json_ids: Vec<String> = order
+            .iter()
+            .filter(|id| reqs.get(*id).and_then(|e| e.get("mime_type")).and_then(Value::as_str).is_some_and(|m| m.contains("json")))
+            .cloned()
+            .collect();
+        let mut outlined = 0u64;
+        let mut tried = 0u64;
+        let mut ids = json_ids.iter().take(JSON_OUTLINE_CAP);
+        for id in ids.by_ref() {
             if dl.expired() {
                 break;
             }
-            let is_json = reqs.get(&id).and_then(|e| e.get("mime_type")).and_then(Value::as_str).is_some_and(|m| m.contains("json"));
-            if !is_json {
-                continue;
-            }
+            tried += 1;
             if let Ok(body) = client.call("Network.getResponseBody", json!({"requestId": id}), None, dl)
                 && let Some(text) = body.get("body").and_then(Value::as_str)
             {
@@ -588,19 +600,37 @@ pub(crate) fn collect_network(
                 };
                 if let Some(t) = decoded
                     && let Ok(v) = serde_json::from_str::<Value>(&t)
-                    && let Some(entry) = reqs.get_mut(&id)
+                    && let Some(entry) = reqs.get_mut(id)
                 {
                     entry["json_body_outline"] = web_common::json_outline(&v);
+                    outlined += 1;
                 }
             }
         }
+        // Why each JSON response got no outline, so a missing outline isn't read as a response with
+        // no JSON body: it was past the cap, the deadline ended the reading, or its body couldn't
+        // be read as JSON (a redirect, a body Chrome no longer holds, text that isn't JSON).
+        let total = json_ids.len() as u64;
+        let past_cap = total.saturating_sub(JSON_OUTLINE_CAP as u64);
+        let after_deadline = total.saturating_sub(past_cap).saturating_sub(tried);
+        json = Some(json!({
+            "json_responses": total,
+            "json_outlines": outlined,
+            "json_outlines_past_cap": past_cap,
+            "json_outlines_after_deadline": after_deadline,
+            "json_outlines_unreadable": tried.saturating_sub(outlined),
+        }));
     }
+    let mut kept_bodies = None;
     if content.response_body {
-        let ids: Vec<String> = order.iter().take(200).cloned().collect();
+        let ids: Vec<String> = order.iter().take(RESPONSE_BODY_CAP).cloned().collect();
+        let mut tried = 0u64;
+        let mut unreadable = 0u64;
         for id in ids {
             if dl.expired() {
                 break;
             }
+            tried += 1;
             let kept = match client.call("Network.getResponseBody", json!({"requestId": id}), None, dl) {
                 Ok(body) => {
                     let text = body.get("body").and_then(Value::as_str).unwrap_or_default();
@@ -611,15 +641,115 @@ pub(crate) fn collect_network(
                     };
                     web_common::kept_body(&raw, secrets)
                 }
-                Err(e) => json!({"state": "unavailable", "reason": e.message}),
+                Err(e) => {
+                    unreadable += 1;
+                    json!({"state": "unavailable", "reason": e.message})
+                }
             };
             if let Some(entry) = reqs.get_mut(&id) {
                 entry["response_body"] = kept;
             }
         }
+        // Like the outlines above: a request with no kept body was past the cap, after the
+        // deadline, or its body couldn't be read, never "it had no body".
+        let total = order.len() as u64;
+        let past_cap = total.saturating_sub(RESPONSE_BODY_CAP as u64);
+        kept_bodies = Some(json!({
+            "requests": total,
+            "kept": tried.saturating_sub(unreadable),
+            "past_cap": past_cap,
+            "after_deadline": total.saturating_sub(past_cap).saturating_sub(tried),
+            "unreadable": unreadable,
+        }));
     }
     let items: Vec<Value> = order.iter().filter_map(|id| reqs.get(id).cloned()).collect();
-    json!({"request_count": items.len(), "requests": items})
+    let mut out = json!({"request_count": items.len(), "requests": items});
+    if let Some(json) = json {
+        out["json_outlines"] = json;
+    }
+    if let Some(bodies) = kept_bodies {
+        out["response_bodies"] = bodies;
+    }
+    out
+}
+
+/// Most response bodies a run keeps (`keep_bodies.response_body`).
+const RESPONSE_BODY_CAP: usize = 200;
+
+/// How many of a run's requests kept their response body. When some didn't, a limitation says
+/// how many and why, so a request without `response_body` isn't read as one that had no body.
+fn kept_body_limitation(network: &Value) -> Option<Limitation> {
+    let counts = network.get("response_bodies")?;
+    let total = counts.get("requests")?.as_u64()?;
+    let count = |key: &str| counts.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let kept = count("kept");
+    if total <= kept {
+        return None;
+    }
+    let mut why = Vec::new();
+    for (key, words) in [
+        ("past_cap", format!("past the first {RESPONSE_BODY_CAP} requests")),
+        ("after_deadline", "after the run's deadline".to_string()),
+        ("unreadable", "whose body the browser couldn't return".to_string()),
+    ] {
+        let n = count(key);
+        if n > 0 {
+            why.push(format!("{n} {words}"));
+        }
+    }
+    let rest = match why.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, head)) => format!("{} and {last}", head.join(", ")),
+    };
+    Some(Limitation::new(
+        "response_bodies_partial",
+        format!("{kept} of {total} requests kept a response body; the rest were {rest}, so a missing body doesn't mean the response had none."),
+    ))
+}
+
+/// How many JSON responses in the window got a body outline. When some didn't, a limitation says
+/// so, so an absent outline is never read as "this response had no JSON body" (#1811).
+fn json_outline_limitation(result: &Value) -> Option<Limitation> {
+    let counts = result.pointer("/network/json_outlines")?;
+    let total = counts.get("json_responses")?.as_u64()?;
+    let count = |key: &str| counts.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let outlined = count("json_outlines");
+    if total <= outlined {
+        return None;
+    }
+    let mut why = Vec::new();
+    for (key, words) in [
+        ("json_outlines_past_cap", format!("past the first {JSON_OUTLINE_CAP} JSON responses")),
+        ("json_outlines_after_deadline", "after the window's deadline".to_string()),
+        ("json_outlines_unreadable", "whose body couldn't be read as JSON".to_string()),
+    ] {
+        let n = count(key);
+        if n > 0 {
+            why.push(format!("{n} {words}"));
+        }
+    }
+    let rest = match why.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, head)) => format!("{} and {last}", head.join(", ")),
+    };
+    Some(Limitation::new(
+        "json_outlines_partial",
+        format!(
+            "{outlined} of {total} JSON responses got a body outline; the rest were {rest}, so a missing outline doesn't mean the response had no JSON body."
+        ),
+    ))
+}
+
+/// Write the requests and answers a browser run kept as a HAR 1.2 recording, which
+/// `web_standin_build` reads, so a rebuilt front end can be given recorded answers (#1838).
+pub fn write_recording(requests: &[Value], path: &std::path::Path) -> Result<(), ToolError> {
+    let har = craft_anything_analysis::web_har::har_from_network(requests, &craft_anything_analysis::web_har::utc_iso_now());
+    let bytes = serde_json::to_vec_pretty(&har).map_err(|e| ToolError::internal(format!("the recording couldn't be written: {e}")))?;
+    // The bodies are a person's traffic, not declared secrets: private permissions keep other
+    // users on the machine out of the file, as the stand-in built from it already does.
+    craft_anything_platform::write_atomic_private(path, &bytes)
 }
 
 fn collect_websockets(events: &[cdp::CdpEvent], secrets: &mut Secrets) -> Value {
@@ -778,7 +908,7 @@ fn web_page_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
     let targets = cdp::json_list(&browser.endpoint, &dl)?;
     let target = web_common::pick_target(&targets, p.target_id.as_deref(), Some("page"))?;
     let page_url = web_common::sanitize_url(target.get("url").and_then(Value::as_str).unwrap_or_default());
-    let mut client = web_common::connect_target(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
+    let mut client = web_common::connect_target_answering_dialogs(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
     let flags = CaptureFlags {
         accessibility_text: p.with_accessibility_text,
         console_text: p.with_console_text,
@@ -796,8 +926,9 @@ fn web_page_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
     let scripts_n = cap.result["scripts"].as_array().map_or(0, Vec::len);
     let req_n = cap.result["network"]["request_count"].as_u64().unwrap_or(0);
     let summary = format!(
-        "Inspected {page_url}: {scripts_n} script(s), {req_n} request outline(s), {} frame origin(s).",
-        cap.result["frame_origins"].as_array().map_or(0, Vec::len)
+        "Inspected {page_url}: {scripts_n} script(s), {req_n} request outline(s), {} frame origin(s).{}",
+        cap.result["frame_origins"].as_array().map_or(0, Vec::len),
+        web_common::dialogs_said_in(&cap.result["dialogs"])
     );
     let ev = passive_evidence(
         "web_page_show",
@@ -835,6 +966,7 @@ fn passive_evidence(
     declared_secrets: usize,
     redactions: u64,
 ) -> Result<craft_anything_evidence::Evidence, ToolError> {
+    let outlines_partial = json_outline_limitation(&result);
     let mut b = EvidenceBuilder::new(op, Subject { kind: "website".into(), sha256: None, name: Some(origin.to_string()) }, browser_env(clean_room, browser))
         .params(json!({"endpoint": browser.endpoint.origin, "sensitive_value_declarations": declared_secrets}))
         .result(result)
@@ -851,6 +983,9 @@ fn passive_evidence(
         ))
         .coverage(Coverage { status: CoverageStatus::Partial, examined: None, total: None, next_offset: None })
         .location(Location::new("url", origin.to_string()));
+    if let Some(partial) = outlines_partial {
+        b = b.limitation(partial);
+    }
     if dropped > 0 {
         b = b.limitation(Limitation::new("events_dropped", format!("{dropped} event(s) were dropped against the capture budget")));
     }
@@ -901,7 +1036,7 @@ fn web_page_js_analyze(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, T
     let targets = cdp::json_list(&browser.endpoint, &dl)?;
     let target = web_common::pick_target(&targets, p.target_id.as_deref(), Some("page"))?;
     let page_url = web_common::sanitize_url(target.get("url").and_then(Value::as_str).unwrap_or_default());
-    let mut client = web_common::connect_target(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
+    let mut client = web_common::connect_target_answering_dialogs(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
     let flags = CaptureFlags { script_sources: true, network: false, console: false, ..CaptureFlags::default() };
     let mut secrets = Secrets::new(&[]);
     let cap = capture_page(&mut client, &page_url, flags, p.watch_ms, &mut secrets, ctx, &dl);
@@ -945,11 +1080,13 @@ fn web_page_js_analyze(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, T
         o.insert("origin".into(), json!(page_url));
         o.insert("source_maps".into(), json!(source_maps));
         o.insert("scripts_seen".into(), json!(cap.scripts.len()));
+        o.insert("dialogs".into(), cap.result["dialogs"].clone());
     }
     let summary = format!(
-        "Analysed {} script(s) from {page_url}: {total_modules} module(s), {endpoints} endpoint(s), {routes} route(s){}.",
+        "Analysed {} script(s) from {page_url}: {total_modules} module(s), {endpoints} endpoint(s), {routes} route(s){}.{}",
         cap.scripts.len(),
-        if bundlers.is_empty() { String::new() } else { format!(", bundled with {}", bundlers.join("/")) }
+        if bundlers.is_empty() { String::new() } else { format!(", bundled with {}", bundlers.join("/")) },
+        web_common::dialogs_said_in(&cap.result["dialogs"])
     );
     let ev = EvidenceBuilder::new(
         "web_page_js_analyze",
@@ -1098,7 +1235,7 @@ fn web_page_watch(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolEr
     let targets = cdp::json_list(&browser.endpoint, &dl)?;
     let target = web_common::pick_target(&targets, p.target_id.as_deref(), Some("page"))?;
     let page_url = web_common::sanitize_url(target.get("url").and_then(Value::as_str).unwrap_or_default());
-    let mut client = web_common::connect_target(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
+    let mut client = web_common::connect_target_answering_dialogs(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
     let flags = CaptureFlags { network: true, console: true, websocket_outlines: p.with_websocket_outlines, ..CaptureFlags::default() };
     let mut secrets = Secrets::new(&p.hidden_values);
     let cap = capture_page(&mut client, &page_url, flags, p.watch_ms, &mut secrets, ctx, &dl);
@@ -1106,7 +1243,11 @@ fn web_page_watch(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolEr
     let cap = cap?;
     let req_n = cap.result["network"]["request_count"].as_u64().unwrap_or(0);
     let con_n = cap.result["console"]["count"].as_u64().unwrap_or(0);
-    let summary = format!("Watched {page_url} for {}ms: {req_n} request outline(s), {con_n} console entr(y/ies).", p.watch_ms);
+    let summary = format!(
+        "Watched {page_url} for {}ms: {req_n} request outline(s), {con_n} console entr(y/ies).{}",
+        p.watch_ms,
+        web_common::dialogs_said_in(&cap.result["dialogs"])
+    );
     let ev = passive_evidence(
         "web_page_watch",
         ctx.session.clean_room(),
@@ -1154,13 +1295,15 @@ fn web_mcp_tools_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     let targets = cdp::json_list(&browser.endpoint, &dl)?;
     let target = web_common::pick_target(&targets, p.target_id.as_deref(), Some("page"))?;
     let page_url = web_common::sanitize_url(target.get("url").and_then(Value::as_str).unwrap_or_default());
-    let mut client = web_common::connect_target(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
+    let mut client = web_common::connect_target_answering_dialogs(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
+    let mut dialogs = Vec::new();
     let supported = client.call("WebMCP.enable", json!({}), None, &dl);
     let (available, tools, note) = match supported {
         Ok(_) => {
             let window = window_deadline(ctx, p.watch_ms, &dl);
             let _ = client.pump_until(&window);
             let events = client.take_events();
+            dialogs = web_common::dialogs_from(&events);
             let mut tools: Vec<Value> = Vec::new();
             for ev in events.iter().filter(|e| e.method == "WebMCP.toolsAdded") {
                 for t in ev.params.get("tools").and_then(Value::as_array).into_iter().flatten().take(500) {
@@ -1174,19 +1317,21 @@ fn web_mcp_tools_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
         }
         Err(e) => return cleanup_then_err(&mut client, &dl, e),
     };
+    dialogs.extend(web_common::dialogs_from(&client.take_events()));
     cleanup(&mut client, &dl);
-    let summary = if available {
+    let mut summary = if available {
         format!("WebMCP on {page_url}: {} tool(s) advertised.", tools.len())
     } else {
         format!("WebMCP is not supported by the browser at {}.", browser.endpoint.origin)
     };
+    summary.push_str(&web_common::dialogs_said(&dialogs));
     let ev = EvidenceBuilder::new(
         "web_mcp_tools_list",
         Subject { kind: "website".into(), sha256: None, name: Some(page_url.clone()) },
         browser_env(ctx.session.clean_room(), &browser),
     )
     .params(json!({"endpoint": browser.endpoint.origin}))
-    .result(json!({"origin": page_url, "webmcp_supported": available, "tools": tools, "note": note}))
+    .result(json!({"origin": page_url, "webmcp_supported": available, "tools": tools, "note": note, "dialogs": dialogs}))
     .summary(summary)
     .confidence(Confidence::Observed)
     .authority(Authority::EarlierRecord)
@@ -1229,9 +1374,9 @@ fn web_page_screenshot_take(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutp
     let targets = cdp::json_list(&browser.endpoint, &dl)?;
     let target = web_common::pick_target(&targets, p.target_id.as_deref(), Some("page"))?;
     let page_url = web_common::sanitize_url(target.get("url").and_then(Value::as_str).unwrap_or_default());
-    let mut client = web_common::connect_target(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
-    let _ = client.call("Page.enable", json!({}), None, &dl);
+    let mut client = web_common::connect_target_answering_dialogs(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
     let shot = client.call("Page.captureScreenshot", json!({"format": "png"}), None, &dl);
+    let dialogs = web_common::dialogs_from(&client.take_events());
     cleanup(&mut client, &dl);
     let shot = shot?;
     let data = shot
@@ -1240,14 +1385,15 @@ fn web_page_screenshot_take(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutp
         .ok_or_else(|| ToolError::new(craft_anything_evidence::ErrorCode::GarbledOutput, "the browser returned no screenshot data"))?;
     let bytes = web_common::b64_decode(data)?;
     let artifact = web_common::png_artifact(&bytes)?;
-    let summary = format!("Captured a {}×{} PNG of {page_url} ({} bytes).", artifact["width"], artifact["height"], bytes.len());
+    let summary =
+        format!("Captured a {}×{} PNG of {page_url} ({} bytes).{}", artifact["width"], artifact["height"], bytes.len(), web_common::dialogs_said(&dialogs));
     let ev = EvidenceBuilder::new(
         "web_page_screenshot_take",
         Subject { kind: "website".into(), sha256: None, name: Some(page_url.clone()) },
         browser_env(ctx.session.clean_room(), &browser),
     )
     .params(json!({"endpoint": browser.endpoint.origin, "target_id": p.target_id}))
-    .result(json!({"origin": page_url, "screenshot": artifact}))
+    .result(json!({"origin": page_url, "screenshot": artifact, "dialogs": dialogs}))
     .summary(summary)
     .confidence(Confidence::Observed)
     .authority(Authority::EarlierRecord)
@@ -2172,7 +2318,7 @@ fn web_walkthrough_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
     let targets = cdp::json_list(&browser.endpoint, &dl)?;
     let target = web_common::pick_target(&targets, p.target_id.as_deref(), Some("page"))?;
     let start_url = web_common::sanitize_url(target.get("url").and_then(Value::as_str).unwrap_or_default());
-    let mut client = web_common::connect_target(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
+    let mut client = web_common::connect_target_answering_dialogs(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
     let declared: Vec<String> = p.hidden_values.iter().chain(p.storage.values()).cloned().collect();
     let mut secrets = Secrets::new(&declared);
     let _ = client.call("Page.enable", json!({}), None, &dl);
@@ -2260,14 +2406,17 @@ fn web_walkthrough_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
     let final_artifacts =
         if p.capture.at_end.is_empty() { Value::Null } else { capture_artifacts(&mut client, &p.capture.at_end, 1024 * 1024, &mut secrets, &dl) };
     keep(&mut client, steps.len().checked_sub(1), &mut events);
+    let all: Vec<cdp::CdpEvent> = events.iter().map(|(_, e)| e.clone()).collect();
+    let mut dialogs = web_common::dialogs_from(&all);
+    web_common::redact_dialogs(&mut dialogs, &mut secrets);
     // Network capture over the whole run.
     let network = if p.capture_network {
-        let all: Vec<cdp::CdpEvent> = events.iter().map(|(_, e)| e.clone()).collect();
         let mut dropped = 0u64;
         collect_network(&mut client, &all, false, p.keep_bodies, &mut secrets, &dl, &mut dropped)
     } else {
         Value::Null
     };
+    let bodies_partial = kept_body_limitation(&network);
     let event_rows = if families.is_empty() {
         Value::Null
     } else {
@@ -2291,8 +2440,13 @@ fn web_walkthrough_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
     cleanup(&mut client, &dl);
 
     let ok_steps = steps.iter().filter(|s| s["status"] == "ok").count();
-    let summary =
-        format!("Ran {} of {} scripted step(s) on {start_url}{}.", ok_steps, p.actions.len(), aborted.as_ref().map(|a| format!(" ({a})")).unwrap_or_default());
+    let summary = format!(
+        "Ran {} of {} scripted step(s) on {start_url}{}.{}",
+        ok_steps,
+        p.actions.len(),
+        aborted.as_ref().map(|a| format!(" ({a})")).unwrap_or_default(),
+        web_common::dialogs_said(&dialogs)
+    );
     let result = json!({
         "browser": {"product": browser.product, "started_by": if browser.launched { "craft-anything" } else { "external" }, "cleanup": if browser.launched { "closed" } else { "disconnected" }},
         "start_url": start_url,
@@ -2305,6 +2459,7 @@ fn web_walkthrough_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
         "steps": steps,
         "network": network,
         "aborted": aborted,
+        "dialogs": dialogs,
         "secrets_hidden": p.hidden_values.len(),
         "secret_redactions": secrets.redactions,
     });
@@ -2324,6 +2479,9 @@ fn web_walkthrough_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
         .location(Location::new("url", start_url));
     if p.hidden_values.iter().any(|s| !s.is_empty()) {
         b = b.limitation(Limitation::new("secrets_redacted", format!("{} occurrence(s) of declared values were redacted", secrets.redactions)));
+    }
+    if let Some(l) = bodies_partial {
+        b = b.limitation(l);
     }
     Ok(ToolOutput::evidence(b.build()?))
 }

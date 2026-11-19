@@ -34,7 +34,14 @@ impl Conversation for NotesDuringPoll {
             }
             return vec![AgentEvent::TextDelta { text: "Finished the edit".into() }];
         }
-        vec![AgentEvent::TurnDone { backend: "scripted".into(), input_tokens: 0, output_tokens: 0, cost_usd: None, cost_is_estimate: false }]
+        vec![AgentEvent::TurnDone {
+            backend: "scripted".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            tokens_unknown: false,
+            cost_usd: None,
+            cost_is_estimate: false,
+        }]
     }
 
     fn answer_consent(&mut self, _: &str, _: bool) {}
@@ -122,7 +129,15 @@ fn consumed_note_progress_errors_preserve_the_completed_turn() {
             progress: ws.root.join(BUILD_PROGRESS_FILE),
             directory,
         };
-        let slot = ModelSlot { name: "Scripted".into(), model: Box::new(model), local: true, effort: None, max_turns: 10, context_tokens: 0 };
+        let slot = ModelSlot {
+            name: "Scripted".into(),
+            model: Box::new(model),
+            local: true,
+            effort: None,
+            max_turns: 10,
+            context_tokens: 0,
+            tools: Default::default(),
+        };
         let api = ApiConversation::start(Arc::new(EngineHost(worker.engine.clone())), vec![slot], LoopConfig::default()).unwrap();
         let entry = crate::BackendEntry {
             config: crate::BackendConfig {
@@ -214,7 +229,15 @@ fn consumed_note_resets_survive_failed_and_cancelled_turns() {
                     stop: worker.stop.clone(),
                     calls: calls.clone(),
                 };
-                let slot = ModelSlot { name: "Scripted".into(), model: Box::new(model), local: true, effort: None, max_turns: 10, context_tokens: 0 };
+                let slot = ModelSlot {
+                    name: "Scripted".into(),
+                    model: Box::new(model),
+                    local: true,
+                    effort: None,
+                    max_turns: 10,
+                    context_tokens: 0,
+                    tools: Default::default(),
+                };
                 let api = ApiConversation::start(Arc::new(EngineHost(worker.engine.clone())), vec![slot], LoopConfig::default()).unwrap();
                 let entry = crate::BackendEntry {
                     config: crate::BackendConfig {
@@ -334,7 +357,14 @@ fn what_a_tool_says_reaches_the_feed_while_it_holds_the_session() {
             self.seen |= self.events.try_iter().any(|e| matches!(e, RunEvent::Step { text, .. } if text.starts_with("Ghidra is decompiling")));
             if self.seen || self.polls > 100 {
                 self.release.take().map(|r| r.send(()));
-                return vec![AgentEvent::TurnDone { backend: "scripted".into(), input_tokens: 0, output_tokens: 0, cost_usd: None, cost_is_estimate: false }];
+                return vec![AgentEvent::TurnDone {
+                    backend: "scripted".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    tokens_unknown: false,
+                    cost_usd: None,
+                    cost_is_estimate: false,
+                }];
             }
             Vec::new()
         }

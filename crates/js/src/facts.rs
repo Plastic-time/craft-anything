@@ -8,6 +8,7 @@ use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, walk};
 use oxc_semantic::Scoping;
 use oxc_span::GetSpan;
+use oxc_syntax::number::ToJsString;
 use oxc_syntax::scope::ScopeFlags;
 use oxc_syntax::symbol::SymbolId;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -23,6 +24,11 @@ const MAX_FN_CALLS: usize = 200;
 const MAX_FN_STRINGS: usize = 64;
 const MAX_PATH_DEPTH: usize = 24;
 const MAX_NAMED_OBJECTS: usize = 4_096;
+/// Longest text read through constants (`base + "/v1"`, `` `${base}/v1` ``), in bytes. Longer
+/// text reads as not literal, so concatenating a constant with itself can't double without end.
+const MAX_CONST_TEXT: usize = 4 * 1024;
+/// Room for constant text beyond the source's own size, shared by every constant in the file.
+const CONST_TEXT_SLACK: usize = 1024 * 1024;
 
 /// Keys that make an object literal worth remembering as window options, or as webPreferences.
 const WINDOW_OPTION_KEYS: &[&str] = &["webPreferences", "width", "height", "show", "frame", "title", "parent", "modal"];
@@ -147,6 +153,15 @@ struct Frame {
     index: usize,
 }
 
+/// What `+` needs to know about a value read through constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueType {
+    Text,
+    Number,
+    /// Neither is known, as for `x + 1` with `x` unreadable.
+    Unknown,
+}
+
 pub(crate) struct FactVisitor<'s> {
     src: &'s str,
     lines: &'s LineIndex,
@@ -155,11 +170,25 @@ pub(crate) struct FactVisitor<'s> {
     scoping: Option<&'s Scoping>,
     aliases: HashMap<Key, Ref>,
     const_strings: HashMap<Key, String>,
+    /// The constants in `const_strings` that hold a number, so `n + 1` adds.
+    const_numbers: HashSet<Key>,
+    /// Bytes `const_strings` may still hold: the source's size plus [`CONST_TEXT_SLACK`].
+    const_room: usize,
     /// Object literals bound to a variable: name → (prop → qualified function name).
     object_members: HashMap<Key, Vec<ExposedMember>>,
     frames: Vec<Frame>,
     /// Names for upcoming functions, keyed by the function's span start.
     pending: HashMap<u32, String>,
+    /// The variable an upcoming function expression initializes, keyed by its span start.
+    pending_binding: HashMap<u32, Key>,
+    /// Functions bound to a name (`function f`, `const f = () => …`): index in `facts.functions`
+    /// and the binding.
+    fn_bindings: Vec<(usize, Key)>,
+    /// What `export { … }` lists name, resolved to bindings; matched to functions after the walk,
+    /// since the list may come before the declarations.
+    export_locals: HashSet<Key>,
+    /// Listed names that resolve to no binding, as written.
+    export_names: HashSet<String>,
     pending_window: Option<String>,
     object_prefix: Vec<String>,
     class_names: Vec<String>,
@@ -174,6 +203,24 @@ pub(crate) struct FactVisitor<'s> {
     exported: HashSet<Key>,
     /// Router calls already read as part of an outer router (by span start).
     routers_read: HashSet<u32>,
+    /// Undo frames for conditional, loop, try/catch and deferred function scopes.
+    branch_stack: Vec<BranchUndo>,
+    /// Stack of `VariableDeclaration` kinds (`true` when `var`) for nested declarations.
+    decl_is_var: Vec<bool>,
+    /// Span start of the outer template literal inside a tagged template expression.
+    tagged_quasi_start: Option<u32>,
+}
+
+/// Snapshot of keys first touched inside a conditional/loop/deferred branch, plus keys written there.
+struct BranchUndo {
+    prior: HashMap<Key, PriorBinding>,
+    writes: HashSet<Key>,
+}
+
+/// Saved constant and module alias state for a binding prior to entering a branch.
+struct PriorBinding {
+    constant: Option<(String, ValueType)>,
+    alias: Option<Ref>,
 }
 
 /// What an alias, constant or object is recorded under: its symbol when scopes are known,
@@ -193,9 +240,15 @@ impl<'s> FactVisitor<'s> {
             facts: ModuleFacts::default(),
             aliases: HashMap::new(),
             const_strings: HashMap::new(),
+            const_numbers: HashSet::new(),
+            const_room: src.len().saturating_add(CONST_TEXT_SLACK),
             object_members: HashMap::new(),
             frames: Vec::new(),
             pending: HashMap::new(),
+            pending_binding: HashMap::new(),
+            fn_bindings: Vec::new(),
+            export_locals: HashSet::new(),
+            export_names: HashSet::new(),
             pending_window: None,
             object_prefix: Vec::new(),
             class_names: Vec::new(),
@@ -205,6 +258,9 @@ impl<'s> FactVisitor<'s> {
             named_windows: Vec::new(),
             exported: HashSet::new(),
             routers_read: HashSet::new(),
+            branch_stack: Vec::new(),
+            decl_is_var: Vec::new(),
+            tagged_quasi_start: None,
         }
     }
 
@@ -213,6 +269,7 @@ impl<'s> FactVisitor<'s> {
     /// could change them, so the window goes back to `dynamic`. Call after the walk.
     pub fn finish(&mut self) {
         self.api_finish();
+        self.mark_listed_exports();
         let mut spoiled: HashSet<&Key> = HashSet::new();
         // Past the cap an export may have gone unrecorded.
         let all_exported = self.exported.len() >= MAX_LIST;
@@ -234,6 +291,32 @@ impl<'s> FactVisitor<'s> {
                 w.web_preferences = WindowOptions::dynamic().prefs;
                 w.preload = None;
                 w.options_from = None;
+            }
+        }
+    }
+
+    /// Mark the functions `export { … }` lists name. A function bound to a name is exported when
+    /// its binding is listed (`export { f }; function f() {}` included), whether it was declared,
+    /// initialized a variable or was assigned to one. A listed name that resolves to no binding is
+    /// matched by name against module-level functions bound to nothing.
+    fn mark_listed_exports(&mut self) {
+        let mut bound = vec![false; self.facts.functions.len()];
+        for (i, k) in &self.fn_bindings {
+            if let Some(b) = bound.get_mut(*i) {
+                *b = true;
+            }
+            if self.export_locals.contains(k)
+                && let Some(f) = self.facts.functions.get_mut(*i)
+            {
+                f.exported = true;
+            }
+        }
+        if self.export_names.is_empty() {
+            return;
+        }
+        for (f, bound) in self.facts.functions.iter_mut().zip(bound) {
+            if !bound && f.parent.is_none() && self.export_names.contains(&f.name) {
+                f.exported = true;
             }
         }
     }
@@ -281,10 +364,7 @@ impl<'s> FactVisitor<'s> {
             Expression::ParenthesizedExpression(p) => self.expr_ref(&p.expression, depth + 1),
             Expression::SequenceExpression(s) => s.expressions.last().and_then(|x| self.expr_ref(x, depth + 1)),
             Expression::StaticMemberExpression(m) => Some(self.expr_ref(&m.object, depth + 1)?.push(m.property.name.as_str())),
-            Expression::ComputedMemberExpression(m) => match &m.expression {
-                Expression::StringLiteral(s) => Some(self.expr_ref(&m.object, depth + 1)?.push(s.value.as_str())),
-                _ => None,
-            },
+            Expression::ComputedMemberExpression(m) => static_str(&m.expression).and_then(|s| Some(self.expr_ref(&m.object, depth + 1)?.push(s))),
             Expression::ChainExpression(c) => match &c.expression {
                 ChainElement::StaticMemberExpression(m) => Some(self.expr_ref(&m.object, depth + 1)?.push(m.property.name.as_str())),
                 ChainElement::CallExpression(call) => self.expr_ref(&call.callee, depth + 1),
@@ -303,19 +383,29 @@ impl<'s> FactVisitor<'s> {
                 }
                 // A call inside a member chain: `document.getElementById("x").addEventListener`.
                 let mut r = self.expr_ref(&call.callee, depth + 1)?;
-                let arg = match call.arguments.first().and_then(|a| a.as_expression()).map(|e| e.get_inner_expression()) {
-                    Some(Expression::StringLiteral(s)) if s.value.len() <= 64 => s.value.to_string(),
+                let arg = match call.arguments.first().and_then(|a| a.as_expression()).and_then(static_str) {
+                    Some(s) if s.len() <= 64 => s.to_string(),
                     _ => String::new(),
                 };
                 let last = r.segs.pop().unwrap_or_default();
                 r.segs.push(format!("{last}({arg})"));
                 Some(r)
             }
-            Expression::AwaitExpression(a) => self.expr_ref(&a.argument, depth + 1),
-            Expression::ImportExpression(i) => match &i.source {
-                Expression::StringLiteral(s) => Some(Ref { module: Some(normalize_module(s.value.as_str())), segs: Vec::new() }),
-                _ => None,
-            },
+            Expression::AwaitExpression(a) => {
+                let mut inner = a.argument.get_inner_expression();
+                let mut step = depth + 1;
+                while let Expression::SequenceExpression(s) = inner {
+                    if step >= MAX_PATH_DEPTH {
+                        return None;
+                    }
+                    inner = s.expressions.last()?.get_inner_expression();
+                    step += 1;
+                }
+                match inner {
+                    Expression::ImportExpression(i) => static_str(&i.source).map(|s| Ref { module: Some(normalize_module(s)), segs: Vec::new() }),
+                    other => self.expr_ref(other, step),
+                }
+            }
             _ => None,
         }
     }
@@ -325,19 +415,28 @@ impl<'s> FactVisitor<'s> {
     }
 
     /// Render an expression as a string when it is (partly) literal: `(text, fully_literal)`.
+    /// Text built from more than one part is at most [`MAX_CONST_TEXT`] bytes, or `None`.
     pub(crate) fn render_value(&self, e: &Expression<'_>, depth: usize) -> Option<(String, bool)> {
+        self.render_typed(e, depth).map(|(v, literal, _)| (v, literal))
+    }
+
+    /// [`Self::render_value`], also saying whether the value is text or a number, which `+`
+    /// needs: text joins, two numbers add. Numbers read as JavaScript turns them into text
+    /// (`0x10` is `16`).
+    fn render_typed(&self, e: &Expression<'_>, depth: usize) -> Option<(String, bool, ValueType)> {
         if depth > 16 {
             return None;
         }
         match e {
-            Expression::StringLiteral(s) => Some((s.value.to_string(), true)),
-            Expression::NumericLiteral(n) => Some((self.text(n.span).to_string(), true)),
-            Expression::ParenthesizedExpression(p) => self.render_value(&p.expression, depth + 1),
+            Expression::StringLiteral(s) => Some((s.value.to_string(), true, ValueType::Text)),
+            Expression::NumericLiteral(n) => Some((n.value.to_js_string(), true, ValueType::Number)),
+            Expression::ParenthesizedExpression(p) => self.render_typed(&p.expression, depth + 1),
             Expression::TemplateLiteral(t) => {
                 let mut out = String::new();
                 let mut literal = true;
                 for (i, q) in t.quasis.iter().enumerate() {
-                    out.push_str(q.value.cooked.as_ref().map_or(q.value.raw.as_str(), |c| c.as_str()));
+                    let c = q.value.cooked.as_ref()?;
+                    out.push_str(c.as_str());
                     if let Some(x) = t.expressions.get(i) {
                         match self.render_value(x, depth + 1) {
                             Some((v, true)) => out.push_str(&v),
@@ -347,21 +446,252 @@ impl<'s> FactVisitor<'s> {
                             }
                         }
                     }
+                    if out.len() > MAX_CONST_TEXT && !t.expressions.is_empty() {
+                        return None;
+                    }
                 }
-                Some((out, literal))
+                Some((out, literal, ValueType::Text))
             }
             Expression::BinaryExpression(b) if b.operator == BinaryOperator::Addition => {
-                let l = self.render_value(&b.left, depth + 1);
-                let r = self.render_value(&b.right, depth + 1);
+                let l = self.render_typed(&b.left, depth + 1);
+                let r = self.render_typed(&b.right, depth + 1);
+                let types = (l.as_ref().map(|x| x.2), r.as_ref().map(|x| x.2));
+                if let (Some((ls, ll, lt)), Some((rs, rl, rt))) = (l.as_ref(), r.as_ref())
+                    && *lt == ValueType::Number
+                    && *rt == ValueType::Number
+                {
+                    // `1 + 2` is 3, not "12".
+                    let (v, t) = combine_addition((ls.as_str(), *lt), (rs.as_str(), *rt))?;
+                    return Some((v, *ll && *rl, t));
+                }
                 if l.is_none() && r.is_none() {
                     return None;
                 }
-                let (ls, ll) = l.unwrap_or_else(|| (hole(&b.left, self), false));
-                let (rs, rl) = r.unwrap_or_else(|| (hole(&b.right, self), false));
-                Some((format!("{ls}{rs}"), ll && rl))
+                // Text on either side makes `+` join; otherwise it may add, so the result can't
+                // be read as text.
+                let text = matches!(types, (Some(ValueType::Text), _) | (_, Some(ValueType::Text)));
+                let (ls, ll, _) = l.unwrap_or_else(|| (hole(&b.left, self), false, ValueType::Unknown));
+                let (rs, rl, _) = r.unwrap_or_else(|| (hole(&b.right, self), false, ValueType::Unknown));
+                if ls.len().saturating_add(rs.len()) > MAX_CONST_TEXT {
+                    return None;
+                }
+                Some((format!("{ls}{rs}"), ll && rl && text, if text { ValueType::Text } else { ValueType::Unknown }))
             }
-            Expression::Identifier(id) => self.key_ref(id).and_then(|k| self.const_strings.get(&k)).map(|v| (v.clone(), true)),
+            Expression::Identifier(id) => {
+                let k = self.key_ref(id)?;
+                let v = self.const_strings.get(&k)?;
+                let t = if self.const_numbers.contains(&k) { ValueType::Number } else { ValueType::Text };
+                Some((v.clone(), true, t))
+            }
             _ => None,
+        }
+    }
+
+    /// Give a binding its new constant text, or none when it can't be read. The old text goes
+    /// either way, so it is never reported in place of the new value. Call after the initializer
+    /// has been visited: it may still read the old text (`var u = fetch(u)`). Every constant shares
+    /// one budget, so many long ones can't add up without end.
+    fn replace_const(&mut self, k: Key, value: Option<(String, ValueType)>) {
+        if let Some(old) = self.const_strings.remove(&k) {
+            self.const_room = self.const_room.saturating_add(old.len());
+        }
+        self.const_numbers.remove(&k);
+        if let Some((v, t)) = value
+            && v.len() <= MAX_CONST_TEXT
+            && v.len() <= self.const_room
+        {
+            self.const_room = self.const_room.saturating_sub(v.len());
+            if t == ValueType::Number {
+                self.const_numbers.insert(k.clone());
+            }
+            self.const_strings.insert(k, v);
+        }
+    }
+
+    /// Snapshot `k` in the innermost active branch frame before it is modified there.
+    fn snapshot_key(&mut self, k: &Key) {
+        if let Some(frame) = self.branch_stack.last_mut()
+            && !frame.prior.contains_key(k)
+        {
+            let old_const = self.const_strings.get(k).map(|v| {
+                let t = if self.const_numbers.contains(k) { ValueType::Number } else { ValueType::Text };
+                (v.clone(), t)
+            });
+            let old_alias = self.aliases.get(k).cloned();
+            frame.prior.insert(k.clone(), PriorBinding { constant: old_const, alias: old_alias });
+        }
+    }
+
+    /// Record a write to `k` in the active branch frame so it is invalidated when the branch exits.
+    fn record_write(&mut self, k: &Key) {
+        self.snapshot_key(k);
+        if let Some(frame) = self.branch_stack.last_mut() {
+            frame.writes.insert(k.clone());
+        }
+    }
+
+    /// Start tracking constant and alias mutations for a conditional, loop or deferred scope.
+    fn enter_branch(&mut self) {
+        self.branch_stack.push(BranchUndo { prior: HashMap::new(), writes: HashSet::new() });
+    }
+
+    /// Restore tracked constants and aliases to their pre-branch state and return keys written inside.
+    fn rollback_branch(&mut self) -> HashSet<Key> {
+        let Some(frame) = self.branch_stack.pop() else {
+            return HashSet::new();
+        };
+        for (k, prior) in frame.prior {
+            self.replace_const(k.clone(), prior.constant);
+            match prior.alias {
+                Some(r) => {
+                    self.aliases.insert(k, r);
+                }
+                None => {
+                    self.aliases.remove(&k);
+                }
+            }
+        }
+        frame.writes
+    }
+
+    /// Clear any tracked constant or module alias for `k` and propagate the write to outer branches.
+    fn invalidate_binding(&mut self, k: &Key) {
+        self.record_write(k);
+        self.replace_const(k.clone(), None);
+        self.aliases.remove(k);
+    }
+
+    /// Invalidate all keys written inside finished branches or loops.
+    fn invalidate_writes(&mut self, writes: HashSet<Key>) {
+        for k in writes {
+            self.invalidate_binding(&k);
+        }
+    }
+
+    /// Resolve a module alias from a `require(...)`, member chain, `await import(...)`, or another aliased identifier.
+    fn resolve_alias(&self, expr: &Expression<'_>) -> Option<Ref> {
+        match expr.get_inner_expression() {
+            Expression::Identifier(id) => self.key_ref(id).and_then(|k| self.aliases.get(&k).cloned()),
+            Expression::CallExpression(_)
+            | Expression::StaticMemberExpression(_)
+            | Expression::ComputedMemberExpression(_)
+            | Expression::ChainExpression(_)
+            | Expression::AwaitExpression(_) => self.expr_ref(expr, 0).filter(|r| r.module.is_some()),
+            _ => None,
+        }
+    }
+
+    /// Evaluate `lhs += rhs` when both sides hold known literal strings or numbers.
+    fn eval_plus_assign(&self, k: &Key, rhs: &Expression<'_>) -> Option<(String, ValueType)> {
+        let lv = self.const_strings.get(k)?;
+        let lt = if self.const_numbers.contains(k) { ValueType::Number } else { ValueType::Text };
+        let (rv, r_lit, rt) = self.render_typed(rhs, 0)?;
+        if !r_lit {
+            return None;
+        }
+        combine_addition((lv.as_str(), lt), (rv.as_str(), rt))
+    }
+
+    /// Collect every identifier key assigned by `target` (bounded recursion).
+    fn collect_target_keys(&self, target: &AssignmentTarget<'_>, depth: usize, out: &mut Vec<Key>) {
+        if depth > MAX_PATH_DEPTH || out.len() >= 256 {
+            return;
+        }
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                if let Some(k) = self.key_ref(id) {
+                    out.push(k);
+                }
+            }
+            AssignmentTarget::TSAsExpression(e) => {
+                if let Some(id) = e.expression.get_inner_expression().get_identifier_reference()
+                    && let Some(k) = self.key_ref(id)
+                {
+                    out.push(k);
+                }
+            }
+            AssignmentTarget::TSSatisfiesExpression(e) => {
+                if let Some(id) = e.expression.get_inner_expression().get_identifier_reference()
+                    && let Some(k) = self.key_ref(id)
+                {
+                    out.push(k);
+                }
+            }
+            AssignmentTarget::TSNonNullExpression(e) => {
+                if let Some(id) = e.expression.get_inner_expression().get_identifier_reference()
+                    && let Some(k) = self.key_ref(id)
+                {
+                    out.push(k);
+                }
+            }
+            AssignmentTarget::TSTypeAssertion(e) => {
+                if let Some(id) = e.expression.get_inner_expression().get_identifier_reference()
+                    && let Some(k) = self.key_ref(id)
+                {
+                    out.push(k);
+                }
+            }
+            AssignmentTarget::ArrayAssignmentTarget(a) => {
+                for elem in a.elements.iter().flatten() {
+                    let inner = match elem {
+                        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => &d.binding,
+                        _ => elem.to_assignment_target(),
+                    };
+                    self.collect_target_keys(inner, depth + 1, out);
+                }
+                if let Some(rest) = &a.rest {
+                    self.collect_target_keys(&rest.target, depth + 1, out);
+                }
+            }
+            AssignmentTarget::ObjectAssignmentTarget(o) => {
+                for prop in &o.properties {
+                    match prop {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+                            if let Some(k) = self.key_ref(&p.binding) {
+                                out.push(k);
+                            }
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                            let inner = match &p.binding {
+                                AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => &d.binding,
+                                _ => p.binding.to_assignment_target(),
+                            };
+                            self.collect_target_keys(inner, depth + 1, out);
+                        }
+                    }
+                }
+                if let Some(rest) = &o.rest {
+                    self.collect_target_keys(&rest.target, depth + 1, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Collect every binding identifier key bound by `pattern` (bounded recursion).
+    fn collect_binding_keys(&self, pattern: &BindingPattern<'_>, depth: usize, out: &mut Vec<Key>) {
+        if depth > MAX_PATH_DEPTH || out.len() >= 256 {
+            return;
+        }
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => out.push(self.key_bind(id)),
+            BindingPattern::AssignmentPattern(p) => self.collect_binding_keys(&p.left, depth + 1, out),
+            BindingPattern::ArrayPattern(a) => {
+                for elem in a.elements.iter().flatten() {
+                    self.collect_binding_keys(elem, depth + 1, out);
+                }
+                if let Some(rest) = &a.rest {
+                    self.collect_binding_keys(&rest.argument, depth + 1, out);
+                }
+            }
+            BindingPattern::ObjectPattern(o) => {
+                for prop in &o.properties {
+                    self.collect_binding_keys(&prop.value, depth + 1, out);
+                }
+                if let Some(rest) = &o.rest {
+                    self.collect_binding_keys(&rest.argument, depth + 1, out);
+                }
+            }
         }
     }
 
@@ -370,11 +700,9 @@ impl<'s> FactVisitor<'s> {
     }
 
     fn arg_str(&self, args: &[Argument<'_>], i: usize) -> Option<String> {
-        args.get(i).and_then(|a| a.as_expression()).and_then(|e| match e.get_inner_expression() {
-            Expression::StringLiteral(s) => Some(s.value.to_string()),
-            Expression::TemplateLiteral(t) if t.expressions.is_empty() => t.quasis.first().map(|q| q.value.raw.to_string()),
-            other => self.render_value(other, 0).filter(|(_, lit)| *lit).map(|(v, _)| v),
-        })
+        args.get(i)
+            .and_then(|a| a.as_expression())
+            .and_then(|e| static_str(e).map(str::to_string).or_else(|| self.render_value(e.get_inner_expression(), 0).filter(|(_, lit)| *lit).map(|(v, _)| v)))
     }
 
     // ---- recording ----
@@ -878,14 +1206,18 @@ impl<'s> FactVisitor<'s> {
                 out.preload = self.path_like(&q.value);
                 continue;
             }
-            let v = match q.value.get_inner_expression() {
-                Expression::BooleanLiteral(b) => PrefValue::Bool(b.value),
-                Expression::StringLiteral(s) => PrefValue::Text(s.value.to_string()),
-                Expression::UnaryExpression(u) if u.operator == UnaryOperator::LogicalNot => match &u.argument {
-                    Expression::NumericLiteral(x) => PrefValue::Bool(x.value == 0.0),
+            let inner = q.value.get_inner_expression();
+            let v = if let Some(s) = static_str(inner) {
+                PrefValue::Text(s.to_string())
+            } else {
+                match inner {
+                    Expression::BooleanLiteral(b) => PrefValue::Bool(b.value),
+                    Expression::UnaryExpression(u) if u.operator == UnaryOperator::LogicalNot => match &u.argument {
+                        Expression::NumericLiteral(x) => PrefValue::Bool(x.value == 0.0),
+                        _ => PrefValue::Text("dynamic".into()),
+                    },
                     _ => PrefValue::Text("dynamic".into()),
-                },
-                _ => PrefValue::Text("dynamic".into()),
+                }
             };
             out.prefs.insert(k.to_string(), v);
         }
@@ -1033,6 +1365,17 @@ impl<'s> FactVisitor<'s> {
     }
 }
 
+fn combine_addition((ls, lt): (&str, ValueType), (rs, rt): (&str, ValueType)) -> Option<(String, ValueType)> {
+    match (lt, rt) {
+        (ValueType::Number, ValueType::Number) => {
+            let sum = ls.parse::<f64>().ok()? + rs.parse::<f64>().ok()?;
+            Some((sum.to_js_string(), ValueType::Number))
+        }
+        (ValueType::Text, _) | (_, ValueType::Text) => (ls.len().saturating_add(rs.len()) <= MAX_CONST_TEXT).then(|| (format!("{ls}{rs}"), ValueType::Text)),
+        _ => None,
+    }
+}
+
 fn clip(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -1059,17 +1402,23 @@ pub(crate) fn is_function_like(e: &Expression<'_>) -> bool {
     matches!(e, Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_))
 }
 
+/// Read a string literal or an untagged no-substitution template literal's cooked value.
+/// Templates with invalid escapes (`cooked: None`) are rejected rather than returning raw text.
+pub(crate) fn static_str<'a>(e: &'a Expression<'a>) -> Option<&'a str> {
+    match e.get_inner_expression() {
+        Expression::StringLiteral(s) => Some(s.value.as_str()),
+        Expression::TemplateLiteral(t) if t.expressions.is_empty() => t.quasis.first().and_then(|q| q.value.cooked.as_ref()).map(|c| c.as_str()),
+        _ => None,
+    }
+}
+
 /// `require("x")` → `x` (string or no-substitution template only).
 pub(crate) fn require_spec(call: &CallExpression<'_>) -> Option<String> {
-    let Expression::Identifier(id) = &call.callee else { return None };
+    let Expression::Identifier(id) = call.callee.get_inner_expression() else { return None };
     if id.name != "require" || call.arguments.len() != 1 {
         return None;
     }
-    match call.arguments.first()?.as_expression()?.get_inner_expression() {
-        Expression::StringLiteral(s) => Some(s.value.to_string()),
-        Expression::TemplateLiteral(t) if t.expressions.is_empty() => t.quasis.first().map(|q| q.value.raw.to_string()),
-        _ => None,
-    }
+    static_str(call.arguments.first()?.as_expression()?).map(str::to_string)
 }
 
 fn is_effect(name: &str, module: Option<&str>) -> bool {
@@ -1186,8 +1535,15 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
         for s in &it.specifiers {
             push_unique(&mut self.facts.exports.esm, s.exported.name().to_string(), MAX_LIST);
             let local = s.local.name().to_string();
-            for f in self.facts.functions.iter_mut().filter(|f| f.name == local) {
-                f.exported = true;
+            if self.export_locals.len() + self.export_names.len() < MAX_LIST {
+                let key = match &s.local {
+                    ModuleExportName::IdentifierReference(r) => self.key_ref(r),
+                    _ => None,
+                };
+                match key {
+                    Some(k) => self.export_locals.insert(k),
+                    None => self.export_names.insert(local.clone()),
+                };
             }
             if self.exported.len() < MAX_LIST {
                 self.exported.insert(Key::Name(local));
@@ -1231,38 +1587,52 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
         walk::walk_import_expression(self, it);
     }
 
+    fn visit_variable_declaration(&mut self, it: &VariableDeclaration<'a>) {
+        self.decl_is_var.push(it.kind == VariableDeclarationKind::Var);
+        walk::walk_variable_declaration(self, it);
+        self.decl_is_var.pop();
+    }
+
     fn visit_variable_declarator(&mut self, it: &VariableDeclarator<'a>) {
         let name = it.id.get_identifier_name().map(|n| n.to_string());
+        let is_var = self.decl_is_var.last().copied().unwrap_or(false);
+        // The binding's new constant text and alias, applied once the initializer has been visited.
+        let mut replacement = None;
+        let mut new_alias = None;
+        let mut decl_keys = Vec::new();
+        let mut clear_keys = Vec::new();
+        let mut object_prefix_name = None;
         if let Some(init) = &it.init {
+            self.collect_binding_keys(&it.id, 0, &mut decl_keys);
+            for k in &decl_keys {
+                if is_var && (self.const_strings.contains_key(k) || self.aliases.contains_key(k)) {
+                    self.record_write(k);
+                } else {
+                    self.snapshot_key(k);
+                }
+            }
             let inner = init.get_inner_expression();
-            // Aliases: require/import bindings and member re-bindings.
-            match inner {
-                Expression::CallExpression(_) | Expression::StaticMemberExpression(_) | Expression::AwaitExpression(_) => {
-                    if let Some(r) = self.expr_ref(inner, 0)
-                        && r.module.is_some()
-                    {
-                        self.bind_pattern_aliases(&it.id, &r);
-                    }
-                }
-                Expression::Identifier(id) => {
-                    if let Some(r) = self.key_ref(id).and_then(|k| self.aliases.get(&k).cloned()) {
-                        self.bind_pattern_aliases(&it.id, &r);
-                    } else if !matches!(it.id, BindingPattern::BindingIdentifier(_)) {
-                        // const { ipcRenderer } = electron (unresolved base)
-                        self.bind_pattern_aliases(&it.id, &Ref::local(id.name.as_str()));
-                    }
-                }
-                _ => {}
+            if let Some(r) = self.resolve_alias(inner) {
+                new_alias = Some(r);
+            } else if let Expression::Identifier(id) = inner
+                && !matches!(it.id, BindingPattern::BindingIdentifier(_))
+            {
+                // const { ipcRenderer } = electron (unresolved base)
+                new_alias = Some(Ref::local(id.name.as_str()));
+            }
+            if let BindingPattern::BindingIdentifier(b) = &it.id {
+                let value = self.render_typed(inner, 0).and_then(|(v, literal, t)| literal.then_some((v, t)));
+                replacement = Some((self.key_bind(b), value));
+            } else {
+                clear_keys = decl_keys.clone();
             }
             if let Some(n) = &name {
-                if let Some((v, true)) = self.render_value(inner, 0)
-                    && let BindingPattern::BindingIdentifier(b) = &it.id
-                {
-                    let k = self.key_bind(b);
-                    self.const_strings.insert(k, v);
-                }
                 if is_function_like(inner) {
                     self.name_next(inner, n.clone());
+                    if let BindingPattern::BindingIdentifier(b) = &it.id {
+                        let k = self.key_bind(b);
+                        self.pending_binding.insert(inner.span().start, k);
+                    }
                 } else if let Expression::NewExpression(_) = inner {
                     self.pending_window = Some(n.clone());
                 } else if let Expression::ObjectExpression(o) = inner {
@@ -1288,15 +1658,32 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
                         self.object_members.insert(k.clone(), members);
                         self.remember_object(k, n, o, it.span.start);
                     }
-                    self.object_prefix.push(n.clone());
-                    walk::walk_variable_declarator(self, it);
-                    self.object_prefix.pop();
-                    return;
+                    object_prefix_name = Some(n.clone());
                 }
             }
         }
-        walk::walk_variable_declarator(self, it);
-        self.pending_window = None;
+        if let Some(prefix) = object_prefix_name {
+            self.object_prefix.push(prefix);
+            walk::walk_variable_declarator(self, it);
+            self.object_prefix.pop();
+        } else {
+            walk::walk_variable_declarator(self, it);
+            self.pending_window = None;
+        }
+        if it.init.is_some() {
+            for k in &decl_keys {
+                self.aliases.remove(k);
+            }
+            if let Some(r) = &new_alias {
+                self.bind_pattern_aliases(&it.id, r);
+            }
+            if let Some((k, value)) = replacement {
+                self.replace_const(k, value);
+            }
+            for k in clear_keys {
+                self.replace_const(k, None);
+            }
+        }
     }
 
     fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
@@ -1304,10 +1691,9 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
             AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
             t => t.as_member_expression().and_then(|m| match m {
                 MemberExpression::StaticMemberExpression(s) => self.expr_ref(&s.object, 0).map(|r| r.push(s.property.name.as_str()).render()),
-                MemberExpression::ComputedMemberExpression(c) => match &c.expression {
-                    Expression::StringLiteral(k) => self.expr_ref(&c.object, 0).map(|r| r.push(k.value.as_str()).render()),
-                    _ => None,
-                },
+                MemberExpression::ComputedMemberExpression(c) => {
+                    static_str(&c.expression).and_then(|k| self.expr_ref(&c.object, 0).map(|r| r.push(k).render()))
+                }
                 _ => None,
             }),
         };
@@ -1337,6 +1723,12 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
             }
             if is_function_like(right) {
                 self.name_next(right, t.clone());
+                // `f = () => …` binds the function to `f` wherever it happens (`init() { f = … }`).
+                if let AssignmentTarget::AssignmentTargetIdentifier(id) = &it.left
+                    && let Some(k) = self.key_ref(id)
+                {
+                    self.pending_binding.insert(right.span().start, k);
+                }
             } else if let Expression::NewExpression(_) = right {
                 self.pending_window = Some(t.clone());
             }
@@ -1354,8 +1746,168 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
                 }
             }
         }
-        walk::walk_assignment_expression(self, it);
+        if it.operator.is_logical() {
+            self.visit_assignment_target(&it.left);
+            self.enter_branch();
+            self.visit_expression(&it.right);
+            let writes = self.rollback_branch();
+            self.invalidate_writes(writes);
+        } else {
+            walk::walk_assignment_expression(self, it);
+        }
         self.pending_window = None;
+        if let AssignmentTarget::AssignmentTargetIdentifier(id) = &it.left {
+            if let Some(k) = self.key_ref(id) {
+                self.record_write(&k);
+                match it.operator {
+                    oxc_syntax::operator::AssignmentOperator::Assign => {
+                        let value = self.render_typed(right, 0).and_then(|(v, literal, t)| literal.then_some((v, t)));
+                        self.replace_const(k.clone(), value);
+                        match self.resolve_alias(right) {
+                            Some(r) => {
+                                self.aliases.insert(k, r);
+                            }
+                            None => {
+                                self.aliases.remove(&k);
+                            }
+                        }
+                    }
+                    oxc_syntax::operator::AssignmentOperator::Addition => {
+                        let value = self.eval_plus_assign(&k, right);
+                        self.replace_const(k.clone(), value);
+                        self.aliases.remove(&k);
+                    }
+                    _ => self.invalidate_binding(&k),
+                }
+            }
+        } else {
+            let mut written = Vec::new();
+            self.collect_target_keys(&it.left, 0, &mut written);
+            for k in written {
+                self.invalidate_binding(&k);
+            }
+        }
+    }
+
+    fn visit_update_expression(&mut self, it: &UpdateExpression<'a>) {
+        walk::walk_update_expression(self, it);
+        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &it.argument
+            && let Some(k) = self.key_ref(id)
+        {
+            self.invalidate_binding(&k);
+        }
+    }
+
+    fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
+        self.visit_expression(&it.test);
+        self.enter_branch();
+        self.visit_statement(&it.consequent);
+        let mut writes = self.rollback_branch();
+        if let Some(alt) = &it.alternate {
+            self.enter_branch();
+            self.visit_statement(alt);
+            writes.extend(self.rollback_branch());
+        }
+        self.invalidate_writes(writes);
+    }
+
+    fn visit_conditional_expression(&mut self, it: &ConditionalExpression<'a>) {
+        self.visit_expression(&it.test);
+        self.enter_branch();
+        self.visit_expression(&it.consequent);
+        let mut writes = self.rollback_branch();
+        self.enter_branch();
+        self.visit_expression(&it.alternate);
+        writes.extend(self.rollback_branch());
+        self.invalidate_writes(writes);
+    }
+
+    fn visit_logical_expression(&mut self, it: &LogicalExpression<'a>) {
+        self.visit_expression(&it.left);
+        self.enter_branch();
+        self.visit_expression(&it.right);
+        let writes = self.rollback_branch();
+        self.invalidate_writes(writes);
+    }
+
+    fn visit_switch_statement(&mut self, it: &SwitchStatement<'a>) {
+        self.enter_branch();
+        walk::walk_switch_statement(self, it);
+        let writes = self.rollback_branch();
+        self.invalidate_writes(writes);
+    }
+
+    fn visit_while_statement(&mut self, it: &WhileStatement<'a>) {
+        self.enter_branch();
+        walk::walk_while_statement(self, it);
+        let writes = self.rollback_branch();
+        self.invalidate_writes(writes);
+    }
+
+    fn visit_do_while_statement(&mut self, it: &DoWhileStatement<'a>) {
+        self.enter_branch();
+        walk::walk_do_while_statement(self, it);
+        let writes = self.rollback_branch();
+        self.invalidate_writes(writes);
+    }
+
+    fn visit_for_statement(&mut self, it: &ForStatement<'a>) {
+        self.enter_branch();
+        walk::walk_for_statement(self, it);
+        let writes = self.rollback_branch();
+        self.invalidate_writes(writes);
+    }
+
+    fn visit_for_statement_left(&mut self, it: &ForStatementLeft<'a>) {
+        walk::walk_for_statement_left(self, it);
+        match it {
+            ForStatementLeft::VariableDeclaration(decl) => {
+                let mut keys = Vec::new();
+                for d in &decl.declarations {
+                    self.collect_binding_keys(&d.id, 0, &mut keys);
+                }
+                for k in keys {
+                    self.invalidate_binding(&k);
+                }
+            }
+            _ => {
+                let mut keys = Vec::new();
+                self.collect_target_keys(it.to_assignment_target(), 0, &mut keys);
+                for k in keys {
+                    self.invalidate_binding(&k);
+                }
+            }
+        }
+    }
+
+    fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
+        self.enter_branch();
+        walk::walk_for_in_statement(self, it);
+        let writes = self.rollback_branch();
+        self.invalidate_writes(writes);
+    }
+
+    fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+        self.enter_branch();
+        walk::walk_for_of_statement(self, it);
+        let writes = self.rollback_branch();
+        self.invalidate_writes(writes);
+    }
+
+    fn visit_try_statement(&mut self, it: &TryStatement<'a>) {
+        self.enter_branch();
+        self.visit_block_statement(&it.block);
+        let try_writes = self.rollback_branch();
+        self.invalidate_writes(try_writes);
+        if let Some(handler) = &it.handler {
+            self.enter_branch();
+            self.visit_catch_clause(handler);
+            let catch_writes = self.rollback_branch();
+            self.invalidate_writes(catch_writes);
+        }
+        if let Some(finalizer) = &it.finalizer {
+            self.visit_block_statement(finalizer);
+        }
     }
 
     fn visit_object_property(&mut self, it: &ObjectProperty<'a>) {
@@ -1368,10 +1920,10 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
                 self.name_next(&it.value, n);
             }
             if k == "path"
-                && let Expression::StringLiteral(s) = it.value.get_inner_expression()
-                && (s.value.starts_with('/') || s.value.as_str() == "*" || s.value.starts_with(":"))
+                && let Some(s) = static_str(&it.value)
+                && (s.starts_with('/') || s == "*" || s.starts_with(':'))
             {
-                self.add_route(s.value.to_string(), "router-config", None, it.span.start);
+                self.add_route(s.to_string(), "router-config", None, it.span.start);
             }
         }
         walk::walk_object_property(self, it);
@@ -1403,9 +1955,19 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
             (id, _) => self.fn_name(id.as_ref().map(|i| i.name.as_str()), it.span),
         };
         let kind = if matches!(it.r#type, FunctionType::FunctionDeclaration) { "declaration" } else { "expression" };
+        let binding = match (&it.id, declared) {
+            (Some(id), true) => Some(self.key_bind(id)),
+            _ => self.pending_binding.remove(&it.span.start),
+        };
         let pushed = self.add_function(name, kind, it.span, &it.params);
+        if pushed && let Some(k) = binding {
+            self.fn_bindings.push((self.facts.functions.len() - 1, k));
+        }
         self.pending_window = None;
+        self.enter_branch();
         walk::walk_function(self, it, flags);
+        let writes = self.rollback_branch();
+        self.invalidate_writes(writes);
         if pushed {
             self.frames.pop();
         }
@@ -1413,9 +1975,16 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
         let name = self.fn_name(None, it.span);
+        let binding = self.pending_binding.remove(&it.span.start);
         let pushed = self.add_function(name, "arrow", it.span, &it.params);
+        if pushed && let Some(k) = binding {
+            self.fn_bindings.push((self.facts.functions.len() - 1, k));
+        }
         self.pending_window = None;
+        self.enter_branch();
         walk::walk_arrow_function_expression(self, it);
+        let writes = self.rollback_branch();
+        self.invalidate_writes(writes);
         if pushed {
             self.frames.pop();
         }
@@ -1423,7 +1992,9 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
 
     fn visit_tagged_template_expression(&mut self, it: &TaggedTemplateExpression<'a>) {
         self.api_tagged(it);
+        let prev = self.tagged_quasi_start.replace(it.quasi.span.start);
         walk::walk_tagged_template_expression(self, it);
+        self.tagged_quasi_start = prev;
     }
 
     fn visit_object_expression(&mut self, it: &ObjectExpression<'a>) {
@@ -1456,14 +2027,24 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
     }
 
     fn visit_template_literal(&mut self, it: &TemplateLiteral<'a>) {
+        let is_tagged = self.tagged_quasi_start == Some(it.span.start);
         if it.expressions.is_empty()
             && let Some(q) = it.quasis.first()
         {
-            let v = q.value.cooked.as_ref().map_or_else(|| q.value.raw.to_string(), |c| c.to_string());
-            self.record_string(&v, it.span.start);
-            self.api_string(&v, it.span.start);
+            let v = match (&q.value.cooked, is_tagged) {
+                (Some(c), _) => Some(c.to_string()),
+                (None, true) => Some(q.value.raw.to_string()),
+                (None, false) => None,
+            };
+            if let Some(v) = v {
+                self.record_string(&v, it.span.start);
+                self.api_string(&v, it.span.start);
+                if !is_tagged && v.starts_with("webpackChunk") {
+                    self.marker("webpackChunk");
+                }
+            }
         }
-        self.api_template(it);
+        self.api_template(it, is_tagged);
         walk::walk_template_literal(self, it);
     }
 
@@ -1491,11 +2072,15 @@ impl<'a> Visit<'a> for FactVisitor<'_> {
             let JSXAttributeItem::Attribute(a) = a else { continue };
             let JSXAttributeName::Identifier(n) = &a.name else { continue };
             let attr = n.name.as_str();
-            if attr == "path"
-                && el.ends_with("Route")
-                && let Some(JSXAttributeValue::StringLiteral(s)) = &a.value
-            {
-                self.add_route(s.value.to_string(), "jsx", None, a.span.start);
+            if attr == "path" && el.ends_with("Route") {
+                let route_path = match &a.value {
+                    Some(JSXAttributeValue::StringLiteral(s)) => Some(s.value.as_str()),
+                    Some(JSXAttributeValue::ExpressionContainer(c)) => c.expression.as_expression().and_then(static_str),
+                    _ => None,
+                };
+                if let Some(p) = route_path {
+                    self.add_route(p.to_string(), "jsx", None, a.span.start);
+                }
             }
             if let Some(ev) = attr.strip_prefix("on").filter(|e| e.chars().next().is_some_and(|c| c.is_ascii_uppercase())) {
                 let handler = match &a.value {

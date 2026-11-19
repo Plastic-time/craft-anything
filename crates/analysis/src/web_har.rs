@@ -70,16 +70,84 @@ pub(crate) struct Redactor {
     log: Vec<Value>,
 }
 
-fn percent_encode(s: &str) -> String {
-    let mut out = String::new();
+/// Percent-encode `s`; when `form` is true, use WHATWG `application/x-www-form-urlencoded` rules
+/// (space becomes `+`, `*` stays literal, `~` is percent-encoded); otherwise keep `~` and encode `*`.
+pub fn encode_query(s: &str, form: bool, upper_hex: bool) -> String {
+    let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+        if form && b == b' ' {
+            out.push('+');
+        } else if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') || (form && b == b'*') || (!form && b == b'~') {
             out.push(char::from(b));
-        } else {
+        } else if upper_hex {
             out.push_str(&format!("%{b:02X}"));
+        } else {
+            out.push_str(&format!("%{b:02x}"));
         }
     }
     out
+}
+
+/// Percent-encode `s` using uppercase hexadecimal escapes (`%20` for spaces).
+fn percent_encode(s: &str) -> String {
+    encode_query(s, false, true)
+}
+
+/// True when `haystack` contains `needle` under ASCII case-insensitive comparison.
+pub fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    !needle.is_empty() && haystack.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Replace ASCII case-insensitive occurrences of `needles` in `s` with `replacement`, merging
+/// overlapping matched spans so an earlier shorter match cannot expose a longer secret's suffix.
+pub fn replace_needles_with(s: &str, needles: &[String], replacement: &str) -> (String, u64) {
+    if needles.is_empty() || !needles.iter().any(|n| contains_ascii_ci(s, n)) {
+        return (s.to_string(), 0);
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (start, _) in s.char_indices() {
+        let Some(tail) = s.get(start..) else { continue };
+        let max_len = needles
+            .iter()
+            .filter(|n| {
+                !n.is_empty()
+                    && tail.len() >= n.len()
+                    && s.is_char_boundary(start + n.len())
+                    && tail.as_bytes().get(..n.len()).is_some_and(|w| w.eq_ignore_ascii_case(n.as_bytes()))
+            })
+            .map(String::len)
+            .max();
+        if let Some(len) = max_len {
+            let end = start + len;
+            if let Some((_, prev_end)) = spans.last_mut()
+                && start < *prev_end
+            {
+                *prev_end = (*prev_end).max(end);
+            } else {
+                spans.push((start, end));
+            }
+        }
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut count = 0u64;
+    let mut cursor = 0usize;
+    for (start, end) in spans {
+        if let Some(prefix) = s.get(cursor..start) {
+            out.push_str(prefix);
+        }
+        out.push_str(replacement);
+        count = count.saturating_add(1);
+        cursor = end;
+    }
+    if let Some(rest) = s.get(cursor..) {
+        out.push_str(rest);
+    }
+    (out, count)
+}
+
+/// Replace ASCII case-insensitive occurrences of `needles` (merging overlapping matches) with `[redacted]`.
+fn replace_needles(s: &str, needles: &[String]) -> String {
+    replace_needles_with(s, needles, "[redacted]").0
 }
 
 impl Redactor {
@@ -87,7 +155,27 @@ impl Redactor {
         let mut needles: Vec<String> = Vec::new();
         for v in values.iter().filter(|v| !v.is_empty()) {
             let json_escaped = serde_json::to_string(v).ok().and_then(|q| q.get(1..q.len().saturating_sub(1)).map(String::from)).unwrap_or_default();
-            for form in [v.clone(), v.to_ascii_lowercase(), percent_encode(v), percent_encode(v).to_ascii_lowercase(), json_escaped, v.replace(' ', "+")] {
+            let pct_up = percent_encode(v);
+            let pct_lo = encode_query(v, false, false);
+            let form_up = encode_query(v, true, true);
+            let form_lo = encode_query(v, true, false);
+            let quote_plus_up = pct_up.replace("%20", "+");
+            let quote_plus_lo = pct_lo.replace("%20", "+");
+            for form in [
+                v.clone(),
+                v.to_ascii_lowercase(),
+                v.to_ascii_uppercase(),
+                pct_up.clone(),
+                pct_lo,
+                pct_up.to_ascii_lowercase(),
+                form_up.clone(),
+                form_lo,
+                form_up.to_ascii_lowercase(),
+                quote_plus_up,
+                quote_plus_lo,
+                json_escaped,
+                v.replace(' ', "+"),
+            ] {
                 if !form.is_empty() && !needles.contains(&form) {
                     needles.push(form);
                 }
@@ -98,7 +186,7 @@ impl Redactor {
     }
 
     fn contains(&self, s: &str) -> bool {
-        self.needles.iter().any(|n| s.contains(n.as_str()))
+        self.needles.iter().any(|n| contains_ascii_ci(s, n))
     }
 
     /// Replace declared values in kept text.
@@ -106,10 +194,7 @@ impl Redactor {
         if !self.contains(s) {
             return s.to_string();
         }
-        let mut out = s.to_string();
-        for n in &self.needles {
-            out = out.replace(n.as_str(), "[redacted]");
-        }
+        let out = replace_needles(s, &self.needles);
         self.log.push(json!({"pointer": pointer, "reason": "secret-value"}));
         out
     }
@@ -141,7 +226,7 @@ pub(crate) fn split_url(url: &str) -> (String, String, String, Vec<(String, Stri
 }
 
 /// Decode a query name once for privacy checks; malformed escapes stay literal.
-fn decode_query_name(name: &str) -> String {
+pub(crate) fn decode_query_name(name: &str) -> String {
     let mut decoded = Vec::with_capacity(name.len());
     let mut bytes = name.as_bytes().iter().copied().peekable();
     while let Some(b) = bytes.next() {
@@ -278,7 +363,7 @@ pub struct OutlineRedactions<'r> {
 
 impl OutlineRedactions<'_> {
     fn names_hit(&self, k: &str) -> bool {
-        self.needles.iter().any(|n| k.contains(n.as_str()))
+        self.needles.iter().any(|n| contains_ascii_ci(k, n))
     }
 }
 
@@ -334,17 +419,28 @@ fn body_outline(
         red.log.extend(sr.log);
         return json!({"kind": "json", "bytes": bytes, "outline": outline});
     }
+    let filter_form_fields = |names: Vec<String>, red: &mut Redactor| -> Vec<String> {
+        let mut kept = Vec::with_capacity(names.len());
+        for n in names {
+            if red.contains(&n) || red.contains(&decode_query_name(&n)) {
+                red.log.push(json!({"pointer": pointer, "reason": "secret-value", "scope": "form-field"}));
+            } else {
+                kept.push(n);
+            }
+        }
+        kept
+    };
     if mime_l.contains("x-www-form-urlencoded") {
         let names: Vec<String> = if params.is_empty() {
             decoded.as_deref().unwrap_or("").split('&').filter_map(|p| p.split('=').next()).filter(|k| !k.is_empty()).map(String::from).take(200).collect()
         } else {
             params.iter().map(|(k, _)| k.clone()).take(200).collect()
         };
-        let names: Vec<String> = names.into_iter().filter(|n| !red.contains(n)).collect();
-        return json!({"kind": "form", "bytes": bytes, "fields": names});
+        return json!({"kind": "form", "bytes": bytes, "fields": filter_form_fields(names, red)});
     }
     if mime_l.contains("multipart") {
-        return json!({"kind": "multipart", "bytes": bytes, "fields": params.iter().map(|(k, _)| k.clone()).filter(|n| !red.contains(n)).take(200).collect::<Vec<_>>()});
+        let names: Vec<String> = params.iter().map(|(k, _)| k.clone()).take(200).collect();
+        return json!({"kind": "multipart", "bytes": bytes, "fields": filter_form_fields(names, red)});
     }
     if decoded.is_none() {
         return Value::Null;
@@ -555,6 +651,113 @@ pub fn all_strings(v: &Value, out: &mut BTreeSet<String>) {
     }
 }
 
+/// A HAR 1.2 recording of browser network entries, as the browser tools return them (method, url,
+/// status, MIME type and any response body they kept). Nothing is invented: a header reduced to its
+/// length, a body that was left out and a body that came back as bytes are all left out here too.
+/// The result is what `web_standin_build` reads, so a rebuilt front end can be given recorded
+/// answers.
+pub fn har_from_network(requests: &[Value], started: &str) -> Value {
+    let entries: Vec<Value> = requests.iter().map(|r| har_entry(r, started)).collect();
+    json!({
+        "log": {
+            "version": "1.2",
+            "creator": {"name": "Craft Anything", "version": env!("CARGO_PKG_VERSION")},
+            "entries": entries,
+        }
+    })
+}
+
+/// Read a flat header map or the retained values in an outlined one.
+fn har_header_map(value: Option<&Value>) -> Option<&Map<String, Value>> {
+    let map = value?.as_object()?;
+    Some(map.get("kept").and_then(Value::as_object).unwrap_or(map))
+}
+
+/// Write retained textual headers as HAR name-value pairs.
+fn har_headers(headers: Option<&Map<String, Value>>) -> Vec<Value> {
+    headers.into_iter().flatten().filter_map(|(name, v)| v.as_str().map(|v| json!({"name": name, "value": v}))).collect()
+}
+
+/// The text of a body the tools kept, if it is whole: a body cut at the cap would be replayed as
+/// an incomplete answer (invalid JSON, a file missing its end), so only a complete one is used.
+fn har_body<'a>(r: &'a Value, key: &str) -> Option<&'a str> {
+    let body = r.get(key)?;
+    if body.get("state").and_then(Value::as_str) != Some("captured") || body.get("truncated").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    body.get("text").and_then(Value::as_str)
+}
+
+fn har_entry(r: &Value, started: &str) -> Value {
+    let text = |key: &str| r.get(key).and_then(Value::as_str).unwrap_or_default();
+    let request_headers = har_header_map(r.get("request_header_values").or_else(|| r.get("request_headers")));
+    let mut request = json!({
+        "method": if text("method").is_empty() { "GET" } else { text("method") },
+        "url": text("url"),
+        "httpVersion": "HTTP/1.1",
+        "headers": har_headers(request_headers),
+        "queryString": [],
+        "cookies": [],
+        "headersSize": -1,
+        "bodySize": -1,
+    });
+    if let Some(body) = har_body(r, "request_body") {
+        let mime = request_headers
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .find_map(|(_, value)| value.as_str())
+            .unwrap_or_default();
+        request["postData"] = json!({"mimeType": mime, "text": body});
+    }
+    let mut content = json!({"size": 0, "mimeType": text("mime_type")});
+    if let Some(body) = har_body(r, "response_body") {
+        content["text"] = json!(body);
+        content["size"] = json!(r.get("response_body").and_then(|b| b.get("bytes")).and_then(Value::as_u64).unwrap_or(body.len() as u64));
+    }
+    json!({
+        "startedDateTime": started,
+        "time": 0,
+        "request": request,
+        "response": {
+            "status": r.get("status").and_then(Value::as_i64).unwrap_or(0),
+            "statusText": "",
+            "httpVersion": "HTTP/1.1",
+            "headers": har_headers(har_header_map(r.get("response_header_values").or_else(|| r.get("response_headers")))),
+            "cookies": [],
+            "content": content,
+            "redirectURL": "",
+            "headersSize": -1,
+            "bodySize": -1,
+        },
+        "cache": {},
+        "timings": {"send": 0, "wait": 0, "receive": 0},
+    })
+}
+
+/// Now, as an ISO 8601 UTC stamp (`2026-11-14T09:30:00Z`), for a recording's `startedDateTime`.
+pub fn utc_iso_now() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    utc_iso(secs)
+}
+
+/// A Unix time as an ISO 8601 UTC stamp, without a calendar crate: days since the epoch to a civil
+/// date, by Howard Hinnant's algorithm.
+fn utc_iso(secs: u64) -> String {
+    let days = secs / 86_400;
+    let rest = secs % 86_400;
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 };
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3600, (rest % 3600) / 60, rest % 60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,5 +850,100 @@ mod tests {
         let mut r = r;
         assert_eq!(r.text("/x", "q=a%20b%2Fc%22"), "q=[redacted]");
         assert!(inspect_har(b"not json", &HarOptions::default()).is_err());
+    }
+
+    /// A recording written from what a browser run kept reads back as the same requests, and a
+    /// stand-in built from it knows them.
+    #[test]
+    fn a_recording_of_kept_requests_reads_back() {
+        let requests = vec![
+            json!({"method": "GET", "url": "https://api.example.test/v1/items/42", "status": 200, "mime_type": "application/json",
+                   "response_headers": {"content-type": "application/json"},
+                   "response_body": {"state": "captured", "bytes": 11, "text": "{\"title\":1}"},
+                   "request_headers": {"accept": "application/json", "authorization": {"value_length": 12}}}),
+            json!({"method": "POST", "url": "https://api.example.test/v1/items", "status": 201, "mime_type": "application/json",
+                   "request_body": {"state": "captured", "bytes": 9, "text": "{\"a\":true}"},
+                   "response_body": {"state": "not_exposed"}}),
+        ];
+        let har = har_from_network(&requests, "2026-11-14T09:30:00Z");
+        let bytes = serde_json::to_vec(&har).unwrap();
+        let parsed = har::parse(&bytes, 10).unwrap();
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].request.method, "GET");
+        assert_eq!(parsed.entries[0].response.text.as_deref(), Some("{\"title\":1}"));
+        assert_eq!(parsed.entries[1].request.post.as_ref().and_then(|p| p.text.as_deref()), Some("{\"a\":true}"));
+        assert_eq!(parsed.entries[1].response.status, 201);
+        assert_eq!(parsed.entries[1].response.text, None, "a body that wasn't kept isn't invented");
+        // A header whose value was reduced to its length stays out.
+        let headers = har["log"]["entries"][0]["request"]["headers"].as_array().unwrap();
+        assert_eq!(headers.len(), 1);
+        let standin = crate::standin::build(&parsed, &crate::standin::BuildOptions::default());
+        assert_eq!(standin.routes.len(), 2, "{:?}", standin.routes.iter().map(|r| &r.template).collect::<Vec<_>>());
+        assert_eq!(standin.hosts, vec!["api.example.test".to_string()]);
+    }
+
+    /// #1838: the browser keeps headers under `response_headers.kept`; a recording has to read
+    /// that shape or a `Link` a front end paginates with disappears from replayed answers.
+    #[test]
+    fn a_recording_reads_the_nested_header_shape_the_browser_keeps() {
+        let requests = vec![json!({
+            "method": "GET", "url": "https://api.example.test/v1/items?page=2", "status": 200,
+            "mime_type": "application/json",
+            "response_headers": {
+                "kept": {"content-type": "application/json", "link": "</v1/items?page=3>; rel=\"next\"", "x-long": {"value_length": 40}},
+                "credentials_present": ["set-cookie"],
+            },
+            "response_body": {"state": "captured", "bytes": 2, "text": "{}"},
+        })];
+        let har = har_from_network(&requests, "2026-11-14T09:30:00Z");
+        let headers = har["log"]["entries"][0]["response"]["headers"].as_array().unwrap();
+        let link = headers.iter().find(|h| h["name"] == "link").expect("the kept Link header");
+        assert_eq!(link["value"], "</v1/items?page=3>; rel=\"next\"");
+        assert!(headers.iter().any(|h| h["name"] == "content-type"));
+        assert!(!headers.iter().any(|h| h["name"] == "x-long"), "a length isn't a value");
+        let parsed = har::parse(&serde_json::to_vec(&har).unwrap(), 10).unwrap();
+        assert!(parsed.entries[0].response.headers.iter().any(|(name, _)| name == "link"), "{:?}", parsed.entries[0].response.headers);
+    }
+
+    /// #1838: a body cut at the cap would replay as an incomplete answer, so it isn't one.
+    #[test]
+    fn a_recording_leaves_out_a_truncated_body() {
+        let requests = vec![json!({
+            "method": "GET", "url": "https://api.example.test/v1/big", "status": 200, "mime_type": "application/json",
+            "request_body": {"state": "captured", "bytes": 70_000, "truncated": true, "text": "{\"q\":"},
+            "response_body": {"state": "captured", "bytes": 70_000, "truncated": true, "text": "{\"a\":"},
+        })];
+        let har = har_from_network(&requests, "2026-11-14T09:30:00Z");
+        let entry = &har["log"]["entries"][0];
+        assert!(entry["response"]["content"].get("text").is_none(), "{}", entry["response"]);
+        assert!(entry["request"].get("postData").is_none(), "{}", entry["request"]);
+    }
+
+    /// #1838: two GraphQL operations to one endpoint are kept apart by the body they sent, so the
+    /// stand-in answers each with its own.
+    #[test]
+    fn two_operations_to_one_endpoint_are_told_apart_by_their_bodies() {
+        let op = |query: &str, title: &str| {
+            let answer = format!("{{\"data\":{{\"{title}\":[]}}}}");
+            json!({"method": "POST", "url": "https://api.example.test/graphql", "status": 200, "mime_type": "application/json",
+                   "request_body": {"state": "captured", "bytes": query.len(), "text": query},
+                   "response_body": {"state": "captured", "bytes": answer.len(), "text": answer}})
+        };
+        let requests = vec![op("{\"query\":\"query Items { items { id } }\"}", "items"), op("{\"query\":\"query Users { users { id } }\"}", "users")];
+        let har = har_from_network(&requests, "2026-11-14T09:30:00Z");
+        let parsed = har::parse(&serde_json::to_vec(&har).unwrap(), 10).unwrap();
+        let standin = crate::standin::build(&parsed, &crate::standin::BuildOptions::default());
+        let route = standin.routes.iter().find(|r| r.template == "/graphql").expect("one route");
+        let keys: Vec<Option<String>> = route.samples.iter().map(|s| s.request_key.clone()).collect();
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert!(keys.iter().all(Option::is_some), "both bodies are request keys: {keys:?}");
+        assert_ne!(keys[0], keys[1], "the two operations are told apart");
+    }
+
+    #[test]
+    fn a_unix_time_is_written_as_a_utc_stamp() {
+        assert_eq!(utc_iso(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_iso(86_399), "1970-01-01T23:59:59Z");
+        assert_eq!(utc_iso(951_782_400), "2000-02-29T00:00:00Z");
     }
 }

@@ -76,6 +76,14 @@ and *oyun* with its endings as whole words (so *oyuncak*, a toy, stays an app), 
 *internet sitesi*; the Thai catalog adds *เกม* for a game and *เว็บไซต์* and *หน้าเว็บ* for a website,
 so a translated suggestion keeps its project kind.
 
+The saved-builder replacement notice on Make, at build starts and after Just ask uses a UI catalog entry.
+Its Turkish wording was reviewed and approved by native speaker @MacallanTheRoot; other catalogs
+retain the existing English notice pending their own reviews. Builder names are filled after lookup.
+The headless `builder_notice` (CLI, MCP and questions) keeps its English contract. Question
+answers also carry optional `builder_replacement` names (`saved` and `used`), which Just ask
+fills into the same UI template without interpreting the English notice or rewriting the names.
+Older responses with only `builder_notice` are displayed as returned.
+
 The Thai catalog addresses the person as *คุณ* and keeps **Clean room** and **Deep** in English, as
 the title bar does. The glossary: *หลักฐาน* (Evidence), *สิ่งที่พบ* (finding), *โปรเจกต์* (Project),
 *เป้าหมาย* (target), *เครื่องมือ* (tool), *เวิร์กเบนช์* (workbench), *ตัวสร้าง* (builder),
@@ -167,9 +175,9 @@ cargo run -p craft-anything-ui-egui --example snapshot -- --lang zh-hant --only 
 
 Chinese, Korean and Georgian glyphs use the existing craft-fonts fallback, which release and CI builds
 Spanish and Estonian are Latin script and need no extra glyphs. Chinese and Korean glyphs use the existing craft-fonts fallback, which release and CI builds
-Vietnamese needs craft-fonts too: the bundled DM Sans and egui's default fonts lack the letters with
+Vietnamese needs craft-fonts too: the bundled Figtree and egui's default fonts lack the letters with
 stacked marks (ạ, ả, ấ, ế, ơ, ư, ữ…), so a build without craft-fonts shows them as boxes. With
-craft-fonts, Noto Sans CJK SC supplies those letters (a different face from the DM Sans around them);
+craft-fonts, Noto Sans CJK SC supplies those letters (a different face from the Figtree around them);
 the script test in `theme.rs` checks every one of them. Chinese and Korean glyphs use the existing craft-fonts fallback, which release and CI builds
 already include. Local builds must set `CRAFT_FONTS_DIR` to a craft-fonts checkout
 before compiling to get the same glyph coverage; with `CRAFT_FONTS_REQUIRED=1` set as well, a

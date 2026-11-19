@@ -1,5 +1,6 @@
 # ka: original Georgian UI translations. Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>translation. Keep placeholders and escapes intact.
+Default (its own settings)	ნაგულისხმევი (საკუთარი პარამეტრები)
 OpenCode default	OpenCode-ის ნაგულისხმევი
 Model default	მოდელის ნაგულისხმევი
 About 60 GB, an Epic Games account, and Xcode.	დაახლოებით 60 GB, Epic Games-ის ანგარიში და Xcode.
@@ -15,6 +16,7 @@ Close window	ფანჯრის დახურვა
 Command palette	ბრძანებების პალიტრა
 Context window	კონტექსტის ფანჯარა
 Copy the message	შეტყობინების კოპირება
+Copy the version	ვერსიის კოპირება
 Craft Anything on GitHub	Craft Anything GitHub-ზე
 Default	ნაგულისხმევი
 Drag to give the plan more or less room; double-click to reset	გადაათრიეთ, რომ გეგმას მეტი ან ნაკლები ადგილი დაუთმოთ; ორმაგი დაწკაპუნებით — ჩამოყრა
@@ -337,6 +339,7 @@ Couldn't look through that folder.	იმ საქაღალდის და�
 Couldn't open it.	გახსნა ვერ მოხერხდა.
 Couldn't open the folder.	საქაღალდის გახსნა ვერ მოხერხდა.
 Couldn't open {}: {}	{}-ის გახსნა ვერ მოხერხდა: {}
+Couldn't save your settings.	პარამეტრების შენახვა ვერ მოხერხდა.
 Couldn't start a worker thread: {e}	სამუშაო ნაკადის გაშვება ვერ მოხერხდა: {e}
 Couldn't start it.	გაშვება ვერ მოხერხდა.
 Coverage unknown	დაფარვა უცნობია
@@ -1004,6 +1007,7 @@ Saved in	შენახულია:
 Saves space: copies the program and code, and shares dependencies and media with the project. A shared file rewritten in place changes here too.	ზოგავს ადგილს: აკოპირებს პროგრამასა და კოდს, ხოლო დამოკიდებულებებსა და მედიას პროექტთან იზიარებს. ადგილზე გადაწერილი საერთო ფაილი აქაც შეიცვლება.
 Say what you want	თქვით, რა გინდათ
 Say what you want first.	ჯერ თქვით, რა გინდათ.
+This applies once you choose something to recreate above.	ეს მოქმედებს, როცა ზემოთ აირჩევთ, რისი ხელახლა შექმნა გსურთ.
 Say what you want to make, or drop an app or file on the window to look inside it. Everything runs in Clean room mode unless you switch on Deep.	თქვით, რისი შექმნა გსურთ, ან ჩააგდეთ აპი ან ფაილი ფანჯარაზე, რომ მის შიგნით ჩაიხედოთ. ყველაფერი სუფთა ოთახის რეჟიმში მუშაობს, სანამ ღრმა რეჟიმს არ ჩართავთ.
 Screenshot	ეკრანის ანაბეჭდი
 Screenshot a page	გვერდის ეკრანის ანაბეჭდი
@@ -1207,6 +1211,7 @@ Use the projects folder	პროექტების საქაღალდ�
 Use this	ამის გამოყენება
 Use {name}	{name}-ის გამოყენება
 Value flow	მნიშვნელობების ნაკადი
+About	შესახებ
 Version	ვერსია
 View	ხედი
 Waiting	ელოდება
@@ -1387,6 +1392,7 @@ Zoom	მასშტაბი
 {name} builds what you make; answers come from {brain}.	{name} აწყობს იმას, რასაც ქმნით; პასუხები მოდის {brain}-ისგან.
 {name} can't be attached: a message takes pictures up to 20 MB.	{name}-ის მიმაგრება შეუძლებელია: შეტყობინება იღებს სურათებს 20 MB-მდე.
 {name} can't be attached: it isn't a PNG, JPEG, GIF or WebP picture.	{name}-ის მიმაგრება შეუძლებელია: ის PNG, JPEG, GIF ან WebP სურათი არ არის.
+{name} can't be kept to only reading, so it isn't asked questions. Ask with Claude Code, or with an AI that has an API key.	{name}-ის მხოლოდ კითხვით შეზღუდვა შეუძლებელია, ამიტომ მას კითხვებს არ ვუსვამთ. იკითხეთ Claude Code-ით ან AI-ით, რომელსაც API გასაღები აქვს.
 {name} is ready	{name} მზადაა
 {name} is ready.	{name} მზადაა.
 {name} isn't available yet in this build.	{name} ამ აწყობაში ჯერ მიუწვდომელია.
@@ -1488,3 +1494,11 @@ Updated to {version}.	განახლდა {version} ვერსიამ�
 Use Releases or your package manager to update this installation.	ამ ინსტალაციის გასაახლებლად გამოიყენეთ გამოშვებები ან პაკეტების მმართველი.
 You're up to date.	უახლეს ვერსიას იყენებთ.
 {version} is available.	ხელმისაწვდომია {version}.
+Forget a website sign-in	ვებსაიტზე შესვლის დავიწყება
+Sign in to a website	ვებსაიტზე შესვლა
+Some shared files could not be hard-linked and were copied instead ({size}).	ზოგიერთი საერთო ფაილი მყარი ბმულით ვერ დაკავშირდა და დაკოპირდა ({size}).
+This server lists several chat models. Choose one:	ეს სერვერი რამდენიმე ჩატის მოდელს გვთავაზობს. აირჩიეთ ერთი:
+Choose a model	აირჩიეთ მოდელი
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.
