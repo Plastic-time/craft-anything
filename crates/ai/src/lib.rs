@@ -807,10 +807,10 @@ impl AiHub {
         let Some(b) = cfg.backends.iter_mut().find(|b| b.config.name == name) else { return Ok(false) };
         match b.config.kind {
             BackendKind::AgentCli => {
-                // Ask the adapter, not the id: Claude Code is also saved as `claude`, and both must
-                // mean "no --model" when the choice is the default.
-                let claude_code = cli_agents::adapter_for(&b.config.model).ids().contains(&"claude-code");
-                let clear = claude_code && model == crate::anthropic::CLAUDE_CODE_DEFAULT;
+                // Ask the adapter, not the id: Claude Code is also saved as `claude`, and both, like
+                // Codex, must mean "no model passed" when the choice is the default.
+                let own_default = cli_agents::adapter_for(&b.config.model).offers_own_default();
+                let clear = own_default && model == crate::anthropic::CLAUDE_CODE_DEFAULT;
                 if model_options::supported(&b.config) && (clear || b.options.cli_model.as_deref() != Some(model)) {
                     b.options.cli_context = None;
                     b.options.cli_reasoning_effort = None;
@@ -1214,38 +1214,35 @@ impl AiHub {
     /// every toolset is enabled, so it can look inside the original with all of them.
     /// `transcript`: where the conversation is kept, and resumed from when it's there in this
     /// mode. `deep` is the run's mode, given by the caller: a tool that starts a build holds the
-    /// session (#1102).
-    pub fn start_builder(&self, entry: &BackendEntry, beginner: bool, transcript: Option<PathBuf>, deep: bool) -> Result<ApiConversation, ToolError> {
-        use craft_anything_engine::Toolset;
-        let toolsets = if deep { self.engine.registry().toolsets() } else { vec![Toolset::Core, Toolset::Build] };
-        self.start_loop(entry, beginner, transcript, deep, &toolsets, true)
-    }
-
-    /// Start the asset extractor: our agent loop with the Build tools and the game archive tools.
-    pub fn start_extractor(&self, entry: &BackendEntry, beginner: bool, transcript: Option<PathBuf>) -> Result<ApiConversation, ToolError> {
-        use craft_anything_engine::Toolset;
-        self.start_loop(entry, beginner, transcript, true, &[Toolset::Core, Toolset::Build, Toolset::Formats], false)
-    }
-
-    /// Start one loop with these toolsets, keeping its transcript and resuming it only in `deep`.
-    fn start_loop(
+    /// session (#1102). `notes`: the build's notes folder, read between tool steps.
+    pub fn start_builder(
         &self,
         entry: &BackendEntry,
         beginner: bool,
         transcript: Option<PathBuf>,
         deep: bool,
-        toolsets: &[craft_anything_engine::Toolset],
-        lean_for_local: bool,
+        notes: Option<PathBuf>,
     ) -> Result<ApiConversation, ToolError> {
+        use craft_anything_engine::Toolset;
+        let toolsets = if deep { self.engine.registry().toolsets() } else { vec![Toolset::Core, Toolset::Build] };
+        self.start_loop(entry, &toolsets, LoopConfig { beginner, transcript, deep, lean_for_local: true, notes, ..LoopConfig::default() })
+    }
+
+    /// Start the asset extractor: our agent loop with the Build tools and the game archive tools.
+    pub fn start_extractor(&self, entry: &BackendEntry, beginner: bool, transcript: Option<PathBuf>) -> Result<ApiConversation, ToolError> {
+        use craft_anything_engine::Toolset;
+        let cfg = LoopConfig { beginner, transcript, deep: true, ..LoopConfig::default() };
+        self.start_loop(entry, &[Toolset::Core, Toolset::Build, Toolset::Formats], cfg)
+    }
+
+    /// Start one loop with these toolsets and `cfg`, which keeps its transcript and resumes it only
+    /// in its mode; the prices and failure logs are the hub's.
+    fn start_loop(&self, entry: &BackendEntry, toolsets: &[craft_anything_engine::Toolset], cfg: LoopConfig) -> Result<ApiConversation, ToolError> {
         let mut slot = self.build_model(entry)?;
         slot.max_turns = slot.max_turns.max(agent::BUILDER_MAX_TURNS);
         let host = Arc::new(EngineHost(self.engine.clone()));
-        ApiConversation::start_with(
-            host,
-            vec![slot],
-            LoopConfig { beginner, prices: self.config().prices.clone(), transcript, deep, lean_for_local, logs: self.failure_logs(), ..LoopConfig::default() },
-            toolsets.iter().copied().collect(),
-        )
+        let cfg = LoopConfig { prices: self.config().prices.clone(), logs: self.failure_logs(), ..cfg };
+        ApiConversation::start_with(host, vec![slot], cfg, toolsets.iter().copied().collect())
     }
 
     /// Start a conversation with whichever backend fills `role` in the crew.

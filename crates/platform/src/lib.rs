@@ -1,4 +1,5 @@
-//! Native platform services for Craft Anything: owned processes, file safety and program lookup.
+//! Native platform services for Craft Anything: owned processes, file safety and program lookup,
+//! plus the placeholder fill ([`text`]) shared by the AI layer and the UI.
 //!
 //! Every external program Craft Anything runs goes through [`process`]: stdin is closed or fed from
 //! bytes we own, every run has wall and idle deadlines, output is capped and drained on threads,
@@ -13,6 +14,7 @@ pub mod process;
 pub mod serve;
 pub mod standin_server;
 pub mod sync;
+pub mod text;
 pub mod which;
 pub mod window;
 

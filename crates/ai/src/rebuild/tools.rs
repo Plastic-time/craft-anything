@@ -593,7 +593,10 @@ mod tests {
             cost_usd: cost,
             cost_is_estimate: estimate,
             builder_notice: None,
+            builder_replacement: None,
         };
+        let response = serde_json::to_value(answered(None, false)).unwrap();
+        assert!(response.get("builder_notice").is_none() && response.get("builder_replacement").is_none());
         record_question_usage(&ws, &answered(Some(0.02), true));
         let u = ws.usage();
         assert!((u.cost_usd - 0.02).abs() < 1e-9 && u.api_billed_usd == 0.0 && u.priced, "an agent's estimate: {u:?}");

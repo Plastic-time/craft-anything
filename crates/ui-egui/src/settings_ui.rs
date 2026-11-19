@@ -54,9 +54,14 @@ pub fn show(app: &mut CraftApp, ctx: &egui::Context) {
                         (SettingsTab::Builds, "hammer", "Builds"),
                         (SettingsTab::Plugins, "puzzle", "Plugins"),
                         (SettingsTab::Safety, "shield", "Safety"),
+                        (SettingsTab::About, "info", "About"),
                     ] {
+                        // About sits at the bottom of the list, level with the end of the page.
+                        if tab == SettingsTab::About {
+                            ui.add_space((page_height(ctx) - ui.min_rect().height() - TAB_H).max(theme::space::SM));
+                        }
                         let on = app.state.settings_tab == tab;
-                        let (rect, r) = ui.allocate_exact_size(Vec2::new(150.0, 34.0), egui::Sense::click());
+                        let (rect, r) = ui.allocate_exact_size(Vec2::new(150.0, TAB_H), egui::Sense::click());
                         r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, tr(title)));
                         if on {
                             ui.painter().rect_filled(rect, t.radius, t.accent_soft);
@@ -94,8 +99,7 @@ pub fn show(app: &mut CraftApp, ctx: &egui::Context) {
                     let w = ui.available_width();
                     ui.set_width(w);
                     let content_w = w - ui.spacing().scroll.allocated_width();
-                    // As tall as the window allows, so a tab's settings aren't cut off at the fold.
-                    let h = (ctx.content_rect().height() - 220.0).clamp(280.0, 560.0);
+                    let h = page_height(ctx);
                     // Not shrunk to the tab's content: that gave each tab its own width and put the
                     // scroll bar in a different place on every page.
                     let tab = app.state.settings_tab;
@@ -110,6 +114,7 @@ pub fn show(app: &mut CraftApp, ctx: &egui::Context) {
                             SettingsTab::Builds => builds(app, ui),
                             SettingsTab::Plugins => plugins(app, ui),
                             SettingsTab::Safety => safety(app, ui),
+                            SettingsTab::About => about(ui),
                         }
                     });
                 });
@@ -135,6 +140,31 @@ fn row(ui: &mut Ui, title: &str, sub: &str, add: impl FnOnce(&mut Ui)) {
         add(ui);
     });
     ui.add_space(theme::space::MD);
+}
+
+/// A tab's row in Settings' list.
+const TAB_H: f32 = 34.0;
+
+/// How tall a tab's page is: as tall as the window allows, so a tab's settings aren't cut off at
+/// the fold.
+fn page_height(ctx: &egui::Context) -> f32 {
+    (ctx.content_rect().height() - 220.0).clamp(280.0, 560.0)
+}
+
+/// The app's name and version, on every system (only macOS has an About in its menu bar). The
+/// version can be selected, or copied with the button beside it, which the keyboard reaches too
+/// (egui leaves selectable labels out of Tab), for a report.
+fn about(ui: &mut Ui) {
+    let t = Tokens::get(ui.ctx());
+    ui.label(theme::heading("Craft Anything", theme::SECTION));
+    ui.add_space(theme::space::XS);
+    let version = format!("{} {}", tr("Version"), env!("CARGO_PKG_VERSION"));
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(RichText::new(&version).color(t.text_dim).size(theme::BODY)).selectable(true));
+        if icons::button(ui, "copy", theme::ControlSize::Small, false, "Copy the version").clicked() {
+            ui.ctx().copy_text(version.clone());
+        }
+    });
 }
 
 fn general(app: &mut CraftApp, ui: &mut Ui) {
@@ -522,13 +552,13 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                                     ui.label(RichText::new(tr("Asking for its models…")).color(t.text_faint).size(theme::CAPTION));
                                 }
                                 Some((_, Some(models))) => {
-                                    // Claude Code with no choice saved passes no `--model`, so it uses
-                                    // the model its own settings name: `default` is what's shown. An
+                                    // Claude Code or Codex with no choice saved passes no model, so it
+                                    // uses the one its own settings name: `default` is what's shown. An
                                     // API backend's model is its saved `config.model`.
-                                    let claude_code =
-                                        b.kind == BackendKind::AgentCli && craft_anything_ai::cli_agents::adapter_for(&b.model).ids().contains(&"claude-code");
+                                    let own_default =
+                                        b.kind == BackendKind::AgentCli && craft_anything_ai::cli_agents::adapter_for(&b.model).offers_own_default();
                                     let picked = app.backend_options.get(&b.name).and_then(|o| o.cli_model.clone()).unwrap_or_else(|| {
-                                        if claude_code { craft_anything_ai::anthropic::CLAUDE_CODE_DEFAULT.to_string() } else { b.model.clone() }
+                                        if own_default { craft_anything_ai::anthropic::CLAUDE_CODE_DEFAULT.to_string() } else { b.model.clone() }
                                     });
                                     let shown = |m: &str| {
                                         if m == craft_anything_ai::anthropic::CLAUDE_CODE_DEFAULT {

@@ -324,6 +324,7 @@ Website address	Adresse du site web
 Open it	L'ouvrir
 Here's what I found on that page:	Voici ce que j'ai trouvé sur cette page :
 Open something	Ouvrir quelque chose
+About	À propos
 Version	Version
 Type your question after /btw.	Tapez votre question après /btw.
 There's no /{name} command. You can use {commands}.	Il n'y a pas de commande /{name}. Vous pouvez utiliser {commands}.
@@ -417,6 +418,7 @@ For example: a website for my bakery	Par exemple : un site web pour ma boulanger
 Add pictures of the original (optional: screenshots help it look right)	Ajouter des images de l'original (facultatif : des captures d'écran aident à le rendre fidèle)
 Start	Démarrer
 Say what you want first.	Dites d'abord ce que vous voulez.
+This applies once you choose something to recreate above.	Ce choix s'applique une fois que vous avez choisi ci-dessus quoi recréer.
 What do you want to look inside?	Dans quoi voulez-vous regarder ?
 We only read it; nothing runs. Every answer shows how sure we are.	Nous le lisons seulement ; rien ne s'exécute. Chaque réponse indique notre degré de certitude.
 An app or a file	Une application ou un fichier
@@ -1444,6 +1446,7 @@ yesterday	hier
 … {} older	… {} plus anciens
 Drag to give the plan more or less room; double-click to reset	Faites glisser pour donner plus ou moins de place au plan ; double-cliquez pour rétablir
 Copy the message	Copier le message
+Copy the version	Copier la version
 Choose what the builder's approvals get	Choisir ce que reçoivent les autorisations du constructeur
 Reading the web	Lecture du web
 Other commands	Autres commandes
@@ -1493,3 +1496,6 @@ You're up to date.	Vous êtes à jour.
 {version} is available.	La version {version} est disponible.
 Forget a website sign-in	Oublier la connexion à un site web
 Sign in to a website	Se connecter à un site web
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.

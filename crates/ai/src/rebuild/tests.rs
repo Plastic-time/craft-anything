@@ -4337,7 +4337,9 @@ fn a_question_names_a_replaced_saved_builder() {
     let answered = super::question::ask(&hub, &settings, None, &ws, "where is it?", &CancelToken::default()).unwrap();
     assert_eq!(answered.backend, "Claude");
     let notice = answered.builder_notice.as_deref().unwrap_or_default();
-    assert!(notice.contains("Off") && notice.contains("Claude"), "{notice}");
+    assert_eq!(notice, "The AI chosen for this project (Off) is turned off or no longer set up. Claude builds instead.");
+    let response = serde_json::to_value(&answered).unwrap();
+    assert_eq!(response["builder_replacement"], serde_json::json!({"saved": "Off", "used": "Claude"}));
 }
 
 /// A name given on purpose is never ignored: a backend that is off is refused in words that say

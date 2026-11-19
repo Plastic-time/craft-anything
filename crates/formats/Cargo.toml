@@ -14,6 +14,7 @@ craft-evm = { workspace = true }
 craft-java-class = { workspace = true }
 craft-pcap = { workspace = true }
 craft-wasm = { workspace = true }
+craft-dex = { workspace = true }
 craft-har = { workspace = true }
 craft-jsonc = { workspace = true }
 craft-sourcemap = { workspace = true }
@@ -24,6 +25,7 @@ craft-mime = { workspace = true }
 craft-plist = { workspace = true }
 craft-zip = { workspace = true }
 craft-tar = { workspace = true }
+craft-pkcs7 = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

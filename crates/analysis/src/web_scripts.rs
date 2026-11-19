@@ -150,9 +150,11 @@ pub struct PlannedFile {
     pub reason: Option<String>,
 }
 
+/// Sanitize one URL host or path segment for relative disk output, stripping leading and trailing
+/// dots (including dots left at the 100-char cut) so Windows does not fold segments onto peers.
 fn clean_segment(s: &str) -> String {
     let c: String = s.chars().map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | '+') { c } else { '_' }).take(100).collect();
-    let c = c.trim_start_matches('.').to_string();
+    let c = c.trim_matches('.').to_string();
     if c.is_empty() { "_".into() } else { c }
 }
 

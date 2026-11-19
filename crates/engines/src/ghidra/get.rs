@@ -59,14 +59,15 @@ const SCRIPT_CAP: u64 = 16 * 1024;
 const SCRIPT_PATHS: usize = 32;
 
 /// Ghidra's headless launcher from a file the person picked as Ghidra's folder. Whatever is returned
-/// is run as the launcher, so it is only ever Ghidra's own `support/analyzeHeadless` or a script
-/// that runs it:
+/// is run as the launcher, so it is only ever a file named like Ghidra's own `support/analyzeHeadless`
+/// or a short text file that names one by its absolute path (whether it runs it isn't checked):
 /// - the file itself when it is that launcher (by name, as given, even through a link), or a script
 ///   naming that launcher (a wrapper that sets up Java first, say);
 /// - else the launcher of the Ghidra folder the file is in, links followed (`ghidraRun` on PATH as
 ///   a link);
-/// - else, for a start script such as the one Linux packages put on PATH
-///   (`exec /opt/ghidra/ghidraRun "$@"`), the launcher of the Ghidra folder it names.
+/// - else, for a start script that names Ghidra's folder (`exec /opt/ghidra/ghidraRun "$@"`), the
+///   launcher of the Ghidra folder it names. (Arch's package links `/usr/bin/ghidra` to `ghidraRun`
+///   instead, which the case above covers.)
 ///
 /// Anything else is `None`, so the setting isn't listed as Ghidra.
 fn launcher_from_file(file: &Path) -> Option<PathBuf> {

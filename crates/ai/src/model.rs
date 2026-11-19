@@ -232,6 +232,8 @@ pub struct TurnResult {
 pub enum Delta {
     Text(String),
     Thinking(String),
+    /// A line for the feed about the request itself, not the model's words (a wait for its rate limit).
+    Status(String),
 }
 
 /// Cooperative cancellation for a conversation.

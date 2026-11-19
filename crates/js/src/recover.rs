@@ -251,7 +251,17 @@ pub struct RecoveredModule {
     pub note: Option<String>,
 }
 
-/// A safe relative path for a module id: no `..`, no absolute roots, no odd characters.
+/// Whether `path`'s final segment already ends with a known script, stylesheet, component, or data
+/// extension (case-insensitively, with a non-empty stem).
+fn has_known_module_ext(path: &str) -> bool {
+    let leaf = path.rsplit('/').next().unwrap_or(path);
+    leaf.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty() && ["js", "mjs", "cjs", "ts", "tsx", "jsx", "json", "css", "vue", "svelte"].iter().any(|known| ext.eq_ignore_ascii_case(known))
+    })
+}
+
+/// A safe relative path for a module id: no `..`, no absolute roots, no leading or trailing segment
+/// dots, no odd characters, and case-insensitive known-extension preservation.
 pub fn safe_module_path(id: &str, fallback_ext: &str) -> String {
     let trimmed = id.strip_prefix("webpack://").or_else(|| id.strip_prefix("webpack:")).or_else(|| id.strip_prefix("file://")).unwrap_or(id);
     let mut parts = Vec::new();
@@ -262,7 +272,7 @@ pub fn safe_module_path(id: &str, fallback_ext: &str) -> String {
             continue;
         }
         let clean: String = p.chars().map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | '+') { c } else { '_' }).take(120).collect();
-        let clean = clean.trim_start_matches('.').to_string();
+        let clean = clean.trim_matches('.').to_string();
         if !clean.is_empty() {
             parts.push(clean);
         }
@@ -274,8 +284,7 @@ pub fn safe_module_path(id: &str, fallback_ext: &str) -> String {
         parts.push("module".into());
     }
     let mut path = parts.join("/");
-    let has_ext = [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".json", ".css", ".vue", ".svelte"].iter().any(|e| path.ends_with(e));
-    if !has_ext {
+    if !has_known_module_ext(&path) {
         path.push_str(fallback_ext);
     }
     path
@@ -449,6 +458,9 @@ mod tests {
         assert_eq!(safe_module_path("..", ".js"), "module.js");
         assert_eq!(safe_module_path("12", ".js"), "12.js");
         assert_eq!(safe_module_path(".hidden", ".js"), "hidden.js");
+        assert!(!has_known_module_ext(".JS"));
+        assert!(!has_known_module_ext("src/.TS"));
+        assert!(has_known_module_ext("src/a.TS"));
     }
 }
 

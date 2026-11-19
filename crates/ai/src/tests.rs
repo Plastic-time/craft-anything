@@ -369,10 +369,10 @@ fn an_api_transcript_is_resumed_only_in_its_mode() {
     let path = dir.path().join("transcript.json");
     let history = vec![crate::model::Msg::user_text("a Deep conversation")];
     crate::context::save(&path, &history, true).unwrap();
-    assert!(h.start_builder(&entry, false, Some(path.clone()), true).unwrap().resumed(), "Deep continues a Deep transcript");
-    assert!(!h.start_builder(&entry, false, Some(path.clone()), false).unwrap().resumed(), "Clean room starts fresh");
+    assert!(h.start_builder(&entry, false, Some(path.clone()), true, None).unwrap().resumed(), "Deep continues a Deep transcript");
+    assert!(!h.start_builder(&entry, false, Some(path.clone()), false, None).unwrap().resumed(), "Clean room starts fresh");
     crate::context::save(&path, &history, false).unwrap();
-    assert!(!h.start_builder(&entry, false, Some(path), true).unwrap().resumed(), "Deep doesn't continue a Clean room transcript");
+    assert!(!h.start_builder(&entry, false, Some(path), true, None).unwrap().resumed(), "Deep doesn't continue a Clean room transcript");
 }
 
 /// Compare checks either position; enabled named and automatic chat choices still work.
@@ -665,6 +665,13 @@ fn an_ais_model_is_changed() {
     assert_eq!(h.options().get("Claude Code").and_then(|o| o.cli_model.clone()), None);
     assert!(!h.set_model("Nobody", "m").unwrap());
     assert!(h.set_model("Box", " ").is_err());
+    // #2109: Codex takes a model the same way, and its default clears it, so no -m is passed.
+    let codex = BackendConfig { name: "Codex".into(), kind: BackendKind::AgentCli, model: "codex".into(), base_url: None, ssh_host: None, enabled: true };
+    h.add_backend(codex, None).unwrap();
+    assert!(h.set_model("Codex", "first").unwrap());
+    assert_eq!(h.options().get("Codex").and_then(|o| o.cli_model.clone()).as_deref(), Some("first"));
+    assert!(h.set_model("Codex", crate::anthropic::CLAUDE_CODE_DEFAULT).unwrap());
+    assert_eq!(h.options().get("Codex").and_then(|o| o.cli_model.clone()), None);
 
     // The Claude Code adapter is also registered as `claude`; the default must clear for that id
     // too, or a run would pass `--model default` (#470 review).
@@ -1144,7 +1151,7 @@ fn anthropic_streaming_tool_loop_through_the_engine() {
     assert_eq!(r1.path, "/v1/messages");
     assert_eq!(r1.header("x-api-key"), Some("sk-test-123"));
     assert_eq!(r1.header("anthropic-version"), Some("2023-06-01"));
-    assert_eq!(r1.header("anthropic-beta"), Some("server-side-fallback-2026-07-01"));
+    assert_eq!(r1.header("anthropic-beta"), Some("thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01"));
     assert_eq!(r1.header("user-agent"), Some("CraftAnything-dev"));
     let b = &r1.body;
     assert_eq!(b["model"], "claude-opus-5-5");

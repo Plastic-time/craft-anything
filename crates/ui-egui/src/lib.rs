@@ -50,7 +50,7 @@ use craft_anything_engine::evidence::{ErrorCode, Evidence, ToolError, Unknown};
 use craft_anything_engine::{CallOptions, Caller, Consent, Engine, Mode, Settings, TargetKind, ToolOutput, clean_room};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use state::{CenterTab, ChatItem, ConsentAnswer, Fill, RailKind, Screen, UiState};
+use state::{CenterTab, ChatItem, ConsentAnswer, Fill, GameJob, RailKind, Screen, UiState};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1041,8 +1041,9 @@ impl CraftApp {
     }
 
     /// Run a tool for a button on a worker (play, preview, open a folder…); the result comes back
-    /// as `Done::Acted` and is shown by `acted`. A click is the person's consent.
-    pub fn act(&mut self, tool: &'static str, params: Value, title: String) {
+    /// as `Done::Acted` and is shown by `acted`. A click is the person's consent. The job's id lets
+    /// a screen ignore an answer that a newer request has replaced.
+    pub fn act(&mut self, tool: &'static str, params: Value, title: String) -> u64 {
         let engine = self.engine.clone();
         let scope = params.clone();
         self.jobs.spawn(title, false, move |j| {
@@ -1050,10 +1051,10 @@ impl CraftApp {
             let opts = CallOptions::new(Caller::Ui).with_consent(Consent::Granted).with_cancel(j.cancel.clone()).with_progress(&progress);
             let result = engine.call(tool, params, opts).map(|o| o.to_json().get("result").cloned().unwrap_or(Value::Null));
             Ok(Done::Acted { tool, params: scope, result })
-        });
+        })
     }
 
-    fn acted(&mut self, tool: &str, params: &Value, result: Result<Value, ToolError>) {
+    fn acted(&mut self, job: u64, tool: &str, params: &Value, result: Result<Value, ToolError>) {
         match (tool, result) {
             ("project_preview", Ok(v)) => {
                 let url = v.get("url").and_then(Value::as_str).map(str::to_string);
@@ -1121,9 +1122,9 @@ impl CraftApp {
                 | "game_unreal_texture_export"
                 | "game_unity_asset_export",
                 r,
-            ) => game_files::tool_done(self, tool, params, r),
+            ) => game_files::tool_done(self, job, tool, params, r),
             // The Game files screen's look at a picked game.
-            ("core_target_triage", r) => game_files::tool_done(self, tool, params, r),
+            ("core_target_triage", r) => game_files::tool_done(self, job, tool, params, r),
             (_, Ok(_)) => {}
             (_, Err(e)) if clean_room::is_refusal(&e) => self.state.modal = Some(state::Modal::DeepMode),
             (_, Err(e)) => self.toast(e.for_people(), true),
@@ -1559,6 +1560,21 @@ impl CraftApp {
         let done = match done.result {
             Ok(d) => d,
             Err(e) => {
+                self.log(true, e.clone());
+                // A Game files job that failed in the worker settles only its own request; one a
+                // newer pick replaced is logged above and says nothing.
+                if let Some(pending) = self.state.game.finish(job) {
+                    if pending.current {
+                        match pending.kind {
+                            GameJob::FolderScan => self.state.game.looking = false,
+                            GameJob::Listing => self.state.game.loading = false,
+                            // What the game is made of holds neither spinner.
+                            GameJob::Triage => {}
+                        }
+                        self.toast(e, true);
+                    }
+                    return;
+                }
                 if let Some(agent) = checked_agent {
                     self.agent_connections.insert(agent, Some(Err(e.clone())));
                 }
@@ -1571,7 +1587,6 @@ impl CraftApp {
                 if self.ghidra.job == Some(job) {
                     self.ghidra.job = None;
                 }
-                self.log(true, e.clone());
                 self.toast(e, true);
                 return;
             }
@@ -1593,7 +1608,7 @@ impl CraftApp {
             Done::Thumb { path, image } => self.thumb_ready(path, image),
             Done::Preview { path, image } => self.preview_ready(path, image),
             Done::Tool { tool, params, route, result } => self.tool_done(tool, params, route, result),
-            Done::Acted { tool, params, result } => self.acted(tool, &params, result),
+            Done::Acted { tool, params, result } => self.acted(job, tool, &params, result),
             Done::Opened { path, result } => match result {
                 Ok(v) => {
                     // Another target: a new conversation, so answers about two things don't mix.

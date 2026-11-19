@@ -109,9 +109,14 @@ fn first_run_continue_is_reachable_at_the_smallest_window() {
 fn simple_title_bar_keeps_only_the_essentials() {
     let mut h = harness(|| demo::app(demo::engine(Mode::Beginner, true)));
     h.run_steps(3);
-    assert!(h.query_by_label("Advanced").is_none(), "the mode switch lives in Settings in Simple mode");
+    // The title bar has no mode switch in Simple mode: the only one is on Make, beside the ways in.
+    let door = h.get_by_label("Make my own version").rect().center().y;
+    for n in h.query_all_by_label("Advanced") {
+        assert!((n.rect().center().y - door).abs() < 4.0, "the mode switch lives in Settings and on Make in Simple mode");
+    }
     h.get_by_label("Settings");
-    h.get_by_label("Clean room");
+    // The title bar's Clean room switch stays (Make's tiles have one too, further down).
+    assert!(h.query_all_by_label("Clean room").any(|n| n.rect().bottom() < door), "the Clean room switch is in the title bar");
 }
 
 #[test]
@@ -953,8 +958,66 @@ fn website_choice_stays_picked_while_the_address_is_empty() {
     h.get_by_label("Nothing — start fresh").click();
     h.run_steps(3);
     assert!(!h.state().state.make.editing_url);
-    assert!(h.query_by_label("How closely may Craft Anything look at it?").is_none(), "nothing to look at");
+    // Nothing to look at: the choice stays in view, dimmed, and says when it applies.
+    h.get_by_label("How closely may Craft Anything look at it?");
+    h.get_by_label("This applies once you choose something to recreate above.");
+    let deep = h.state().settings.deep_mode;
+    h.get_by_label("Deep").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings.deep_mode, deep, "a dimmed tile changes nothing");
     assert!(h.query_by_label("Type the website's address:").is_none());
+}
+
+/// Make's Simple / Advanced switch changes the app's mode and keeps the screen and the draft (#1286).
+#[test]
+fn the_make_card_switches_simple_and_advanced_and_keeps_the_draft() {
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.state.make.request = "a calculator".into();
+        a
+    });
+    h.run_steps(3);
+    // Simple mode's title bar has no mode switch: Make offers it beside the ways in.
+    h.get_by_label("Mode");
+    h.get_by_label("Advanced").click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings.mode, Mode::Experienced);
+    assert_eq!(h.state().state.make.request, "a calculator", "the draft stays");
+    assert_eq!(h.state().state.screen, Screen::Home, "Make stays in view instead of the workbench");
+    h.get_by_label("What do you want to recreate?");
+    // Back from the card's own switch: the title bar now has one too, higher up.
+    h.query_all_by_label("Simple").max_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).unwrap().click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings.mode, Mode::Beginner);
+    assert_eq!(h.state().state.make.request, "a calculator");
+}
+
+/// At the app's smallest window the Simple / Advanced switch moves under the ways in, inside the
+/// window (#1286).
+#[test]
+fn the_make_mode_switch_stays_inside_the_narrowest_window() {
+    // The app's smallest window (main.rs): the switch moves under the ways in instead of off the edge.
+    let mut h = harness_sized(egui::vec2(760.0, 520.0), || demo::app(demo::engine(Mode::Beginner, true)));
+    h.run_steps(3);
+    let door = h.get_by_label("Just look inside").rect();
+    let advanced = h.get_by_label("Advanced").rect();
+    assert!(advanced.right() <= 760.0, "the switch ends at {} in a 760-point window", advanced.right());
+    assert!(advanced.top() >= door.bottom(), "on its own line below the ways in");
+
+    // Review of #1286: the room the switch needs is measured (so a longer translation moves it
+    // down sooner), not a fixed width. At every width it's beside the ways in or below them,
+    // never over them, and inside the window.
+    for width in [1600.0, 1280.0, 1100.0, 1000.0, 900.0] {
+        let mut h = harness_sized(egui::vec2(width, 820.0), || demo::app(demo::engine(Mode::Beginner, true)));
+        h.run_steps(3);
+        let door = h.get_by_label("Just look inside").rect();
+        let (simple, advanced) = (h.get_by_label("Simple").rect(), h.get_by_label("Advanced").rect());
+        let mode = h.get_by_label("Mode").rect();
+        for part in [simple, advanced, mode] {
+            assert!(!part.intersects(door), "at {width}: {part:?} overlaps the ways in at {door:?}");
+            assert!(part.left() >= 0.0 && part.right() <= width, "at {width}: {part:?} leaves the window");
+        }
+    }
 }
 
 #[test]
@@ -967,7 +1030,8 @@ fn mode_switch_and_deep_toggle() {
         a
     });
     h.run_steps(3);
-    // Simple mode: the switch is in Settings.
+    // Simple mode: the switch is in Settings (and on Make, so look from another screen).
+    h.state_mut().state.screen = Screen::Ask;
     h.state_mut().state.settings_open = true;
     h.run_steps(3);
     h.get_by_label("Advanced").click();
@@ -3616,4 +3680,46 @@ fn a_very_long_app_file_name_keeps_start_inside_the_window() {
     let content = h.ctx.content_rect();
     let start = h.get_by_label("Start").rect();
     assert!(start.left() >= 0.0 && start.right() <= content.right(), "Start ({start:?}) stays inside the window ({content:?})");
+}
+
+/// #1300: the app's version can be seen on every system, under Settings → About at the bottom of
+/// the tab list (only macOS has an About in its menu bar).
+#[test]
+fn settings_about_shows_the_apps_version() {
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.state.settings_open = true;
+        a
+    });
+    h.run_steps(3);
+    let safety = h.get_by_label("Safety").rect();
+    let about = h.get_by_label("About").rect();
+    assert!(about.top() > safety.bottom() + 40.0, "About sits apart at the bottom of the list");
+    h.get_by_label("About").click();
+    h.run_steps(3);
+    let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
+    h.get_by_label(&version);
+    // A button copies it, so a keyboard can too (selectable labels aren't in egui's Tab order).
+    h.get_by_label("Copy the version").click();
+    h.step();
+    let copied = h.output().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if *t == version));
+    assert!(copied, "the button copies the version");
+
+    // The keyboard path: Tab from the About tab reaches the button, and Enter or Space copies.
+    // `key_press` queues the key's press and release, and `step` runs a frame for each, so the
+    // press is sent alone to read the frame it lands in.
+    h.get_by_label("About").focus();
+    h.run_steps(2);
+    h.key_press(egui::Key::Tab);
+    h.run_steps(2);
+    assert!(h.get_by_label("Copy the version").is_focused(), "Tab reaches the copy button");
+    for key in [egui::Key::Enter, egui::Key::Space] {
+        let event = |pressed| egui::Event::Key { key, pressed, modifiers: egui::Modifiers::NONE, repeat: false, physical_key: None };
+        h.event(event(true));
+        h.step();
+        let copied = h.output().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if *t == version));
+        assert!(copied, "{key:?} on the button copies the version");
+        h.event(event(false));
+        h.step();
+    }
 }

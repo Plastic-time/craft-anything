@@ -570,8 +570,9 @@ pub struct StreamParser {
     /// A missing or invalid per-step cost cannot become a complete turn total later.
     cost_incomplete: bool,
     pub saw_result: bool,
-    /// The run was asked to continue a saved session the agent doesn't have (it lives on another
-    /// computer, or under another folder), so it did nothing.
+    /// The run was asked to continue a saved session the agent can't continue: it doesn't have it
+    /// (it lives on another computer, or under another folder), or the session has grown too long
+    /// to take another message. Either way it did nothing, and the next message starts a new one.
     pub session_missing: bool,
     /// A protocol fact about the failed turn, independent of the text shown to the person.
     pub failure: Option<TurnFailure>,
@@ -2555,6 +2556,23 @@ mod tests {
         let events = p.line(&other.to_string());
         assert!(!p.session_missing);
         assert!(matches!(events.as_slice(), [AgentEvent::Error { message, .. }] if message.contains("error_during_execution")), "{events:?}");
+    }
+
+    /// #2042: a conversation too long to take another message is refused the same way however
+    /// often it's resumed, so it is left behind like one that isn't here.
+    #[test]
+    fn a_session_that_has_grown_too_long_is_left_behind() {
+        let full = json!({"type":"result","subtype":"success","is_error":true,"num_turns":1,"session_id":"39b5b312-5678-1234-961c-32112666ffab","total_cost_usd":0,"result":"Prompt is too long"});
+        let mut p = StreamParser::new(adapter_for("claude-code"));
+        let events = p.line(&full.to_string());
+        assert!(p.session_missing);
+        let [AgentEvent::Error { message, remediation: Some(fix), .. }] = events.as_slice() else { panic!("{events:?}") };
+        assert!(message.contains("grown too long") && fix.contains("Ask again"), "{message} / {fix}");
+        // The words inside another failure's text aren't that refusal.
+        let other = json!({"type":"result","subtype":"success","is_error":true,"num_turns":3,"result":"The tool said: Prompt is too long"});
+        let mut p = StreamParser::new(adapter_for("claude-code"));
+        p.line(&other.to_string());
+        assert!(!p.session_missing);
     }
 
     /// #451: Claude Code's session is found wherever it ran, and only by a real id.
