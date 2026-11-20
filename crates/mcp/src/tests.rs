@@ -557,3 +557,106 @@ fn allow_run_says_what_it_turns_off_on_startup() {
     assert!(notice.contains("--allow-run"), "{notice}");
     assert!(notice.contains("without asking"), "say what it turns off: {notice}");
 }
+
+#[test]
+fn stdio_transcript_parity_and_envelope_framing() {
+    let transcript = concat!(
+        "\n",
+        "   \r\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"parity-client\",\"version\":\"1.0\"}}}\r\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":\"list-1\",\"method\":\"tools/list\",\"params\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\",\"params\":{}}\n",
+        "{not-json\n",
+        "[{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}]\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"ping\",\"params\":42}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"no/such_method\",\"params\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"core_session_show\",\"arguments\":{}}}"
+    );
+
+    let engine = Arc::new(Engine::new(craft_anything_engine::testing::session()));
+    let buf = Buf::default();
+    serve(engine, ServerOptions::default(), std::io::Cursor::new(transcript.as_bytes().to_vec()), Box::new(buf.clone())).unwrap();
+    let raw_out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+
+    assert!(raw_out.ends_with('\n'), "every emitted stdio frame must end with a newline: {raw_out:?}");
+
+    // Every emitted frame must round-trip cleanly through craft_mcp_server::read_message.
+    let mut out_reader = std::io::Cursor::new(raw_out.as_bytes().to_vec());
+    let mut frames = Vec::new();
+    while let Some(incoming) = craft_mcp_server::read_message(&mut out_reader, MAX_REQUEST_BYTES).unwrap() {
+        match incoming {
+            craft_mcp_server::Incoming::Line(line) => {
+                let parsed: Value = serde_json::from_str(line.trim_end_matches(['\r', '\n'])).unwrap();
+                assert_eq!(parsed["jsonrpc"], "2.0");
+                frames.push(parsed);
+            }
+            craft_mcp_server::Incoming::Refused(reply) => panic!("unexpected refused output frame: {reply}"),
+        }
+    }
+
+    assert_eq!(frames.len(), 9, "expected 9 responses (1 notification + 2 blank lines skipped): {frames:?}");
+
+    // 1. initialize
+    assert_eq!(frames[0]["id"], json!(1));
+    assert_eq!(frames[0]["result"]["protocolVersion"], "2025-03-26");
+    assert_eq!(frames[0]["result"]["serverInfo"]["name"], SERVER_NAME);
+    assert_eq!(frames[0], craft_mcp_server::response(json!(1), frames[0]["result"].clone()));
+
+    // 2. tools/list (string id)
+    assert_eq!(frames[1]["id"], json!("list-1"));
+    assert_eq!(frames[1], craft_mcp_server::response(json!("list-1"), frames[1]["result"].clone()));
+    let listed = tool_names(&frames[1]);
+    assert!(listed.contains(&"core_session_show".to_string()));
+    assert!(listed.contains(&"core_investigation_show".to_string()));
+    assert!(listed.contains(&"enable_toolset".to_string()));
+
+    // 3. ping with null id
+    assert_eq!(frames[2], craft_mcp_server::response(Value::Null, json!({})));
+
+    // 4. error framing parity with craft-jsonrpc
+    assert_eq!(frames[3], craft_jsonrpc::parse_error_response());
+    assert_eq!(frames[4], craft_jsonrpc::error_response(Value::Null, craft_jsonrpc::RpcError::new(-32600, "Batches are not supported")));
+    assert_eq!(frames[5], craft_jsonrpc::error_response(json!(3), craft_jsonrpc::RpcError::new(-32600, "Invalid request")));
+    assert_eq!(frames[6], craft_jsonrpc::error_response(json!(4), craft_jsonrpc::RpcError::new(-32602, "Invalid params")));
+    assert_eq!(frames[7], craft_jsonrpc::error_response(json!(5), craft_jsonrpc::RpcError::new(-32601, "Method not found: no/such_method")));
+
+    // 5. tools/call (final line without trailing newline at EOF)
+    assert_eq!(frames[8]["id"], json!(6));
+    assert_eq!(frames[8], craft_mcp_server::response(json!(6), frames[8]["result"].clone()));
+    assert_eq!(frames[8]["result"]["isError"], false);
+    assert_eq!(frames[8]["result"]["structuredContent"]["result"]["server"]["name"], SERVER_NAME);
+}
+
+#[test]
+fn stdio_eof_and_newline_bounds() {
+    for empty in ["", "\n", "\r\n  \n\t\r\n"] {
+        let engine = Arc::new(Engine::new(craft_anything_engine::testing::session()));
+        let buf = Buf::default();
+        serve(engine, ServerOptions::default(), std::io::Cursor::new(empty.as_bytes().to_vec()), Box::new(buf.clone())).unwrap();
+        assert!(buf.0.lock().unwrap().is_empty(), "empty/whitespace input {empty:?} must produce no output");
+    }
+
+    // Single request without trailing newline before EOF must still be answered with a newline-terminated frame.
+    let no_eof_newline = "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}";
+    let engine = Arc::new(Engine::new(craft_anything_engine::testing::session()));
+    let buf = Buf::default();
+    serve(engine, ServerOptions::default(), std::io::Cursor::new(no_eof_newline.as_bytes().to_vec()), Box::new(buf.clone())).unwrap();
+    let raw = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(raw.ends_with('\n'));
+    let parsed: Value = serde_json::from_str(raw.trim_end()).unwrap();
+    assert_eq!(parsed, craft_mcp_server::response(json!(42), json!({})));
+
+    // Oversized line boundary via craft_mcp_server::read_message returns Incoming::Refused.
+    let oversized = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+    let mut reader = std::io::Cursor::new(oversized.as_bytes().to_vec());
+    match craft_mcp_server::read_message(&mut reader, 16).unwrap() {
+        Some(craft_mcp_server::Incoming::Refused(reply)) => {
+            let err: Value = serde_json::from_str(reply.trim()).unwrap();
+            assert_eq!(err["jsonrpc"], "2.0");
+            assert!(err["error"]["code"].is_i64());
+        }
+        _ => panic!("expected Incoming::Refused for oversized line"),
+    }
+}

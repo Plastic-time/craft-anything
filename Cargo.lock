@@ -1467,6 +1467,7 @@ version = "0.6.1"
 dependencies = [
  "bzip2-rs",
  "craft-anything-testkit",
+ "craft-dds",
  "craft-dex",
  "craft-elf",
  "craft-evm",
@@ -1480,6 +1481,7 @@ dependencies = [
  "craft-pkcs7",
  "craft-plist",
  "craft-sourcemap",
+ "craft-sqlite",
  "craft-tar",
  "craft-wasm",
  "craft-zip",
@@ -1529,6 +1531,8 @@ dependencies = [
  "craft-anything-engine",
  "craft-anything-evidence",
  "craft-anything-platform",
+ "craft-jsonrpc",
+ "craft-mcp-server",
  "log",
  "serde",
  "serde_json",
@@ -1636,6 +1640,11 @@ version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=d118983bf922ac96c68b885dc55da30435adbc7d#d118983bf922ac96c68b885dc55da30435adbc7d"
 
 [[package]]
+name = "craft-dds"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=429937ad72e16fa2bb5a9f085dee80809e4a566d#429937ad72e16fa2bb5a9f085dee80809e4a566d"
+
+[[package]]
 name = "craft-dex"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=35afed3956e14fb813f8c27bc82d65c2bce00028#35afed3956e14fb813f8c27bc82d65c2bce00028"
@@ -1690,12 +1699,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-jsonrpc"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=512a1b8e8b59a7b325e7f69f6131aa8628470288#512a1b8e8b59a7b325e7f69f6131aa8628470288"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "craft-macho"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=d118983bf922ac96c68b885dc55da30435adbc7d#d118983bf922ac96c68b885dc55da30435adbc7d"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "craft-mcp-server"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=512a1b8e8b59a7b325e7f69f6131aa8628470288#512a1b8e8b59a7b325e7f69f6131aa8628470288"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -1781,6 +1806,11 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "craft-sqlite"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=f428c3d36e0faf3924b76956a01334c051543527#f428c3d36e0faf3924b76956a01334c051543527"
 
 [[package]]
 name = "craft-tar"

@@ -374,8 +374,21 @@ Every round spends the person's money or quota. One that can't do anything shoul
 - [x] A builder step on an API backend stops after 25 failed build commands in a row (none
       succeeding between), says so and keeps the project (`MAX_FAILED_BUILDS` in `agent.rs`, #399:
       9.4M tokens in 19 minutes of the first stage, never compiled). Try again carries on
+- [ ] An unreadable `usage.json` reads as all zeros (`ProjectUsage::load` in `workspace.rs`), so
+      the cost shown can be $0 for a build that spent money. Say the count is unknown instead, as
+      R2.2's ACP line asks for agents' turns
+- [ ] Show what the last run used next to Try again. `usage.json` keeps project totals only
+      (time, tokens, `cost_usd`, `api_billed_usd`); the activity log has each turn's tokens but
+      no cost, since a resumed agent's figure can't be tied to one turn (`activity.rs`). Show
+      the run's tokens, and a cost only where it can be attributed
 - [ ] **decision** Whether a build gets a token or cost limit of its own, beyond rounds and that
-      stop (#399): a model that changes code without ever running a build isn't caught by it
+      stop (#399): a model that changes code without ever running a build isn't caught by it.
+      One shape: price each builder turn before it runs, as asset calls already are
+      (`AssetProvider::estimate` against the project's asset budget, $5 by default), and stop at
+      a limit the person sets. That price is an estimate, so a limit that holds reserves each
+      turn's input and output allowance, counts calls in flight, in parallel and retried, and
+      settles against what the turn used; a turn whose use isn't known doesn't count as money
+      left. #503's spending controls wait on R5.2's wide-PR decision too
 - [ ] Check live that the stop fires on a real API-backend build and the message reads well. It
       fired on a local Ollama build (the same built-in loop) after two turns that changed nothing
       in `app/` ("The build stopped after two builder turns changed no files in app/…"); an
@@ -987,6 +1000,12 @@ Owner: open · Status: in progress
       it carried on, with a core and gigabytes of memory, until the app closed. Pausing still
       leaves it running, so a paused build loses nothing
       — claimed: justinjohn0306, branch `bugfix/r1.5-stop-analysis-for-deleted-project`
+- [x] Validate MCP HTTP plugin URLs against parsed `http::Uri` authorities and shared loopback
+      checks (`host_is_loopback`), trim stored `ServerUrl` whitespace, refuse HTTPS-to-HTTP
+      downgrade redirects, and follow loopback HTTP `307`/`308` redirects by hand only while they
+      stay on this computer (`crates/engines/src/mcp_client.rs`).
+      Unit-tested with local HTTP and TLS servers.
+      — claimed: Plastic-time, branch bugfix/r1.5-mcp-http-cleartext-guard
 - [ ] More pins once their hashes are checked against the publisher: Chromium (no published
       checksums found yet), Rizin for Linux (the tar.xz unpacks to ~800 MB, so it needs streaming
       extraction) and macOS (a .pkg)
@@ -1642,6 +1661,12 @@ Gaps found while using the app for real projects.
       agent setup: `AiHub::start` checks `enabled` and says how to turn it on or choose another
       — PR #1008; claimed: Codex, branch bugfix/r2.9-disabled-chat-backend
       (the API regression uses invalid tunnel settings to detect setup before the guard)
+- [x] `compare` checks both names before it builds either conversation, so an off or unknown
+      second side cannot leave a half-started comparison; a CLI regression covers `chat --backend`
+      with a turned-off agent
+      — claimed: AlexJoaquimPereira, branch `bugfix/r5.5-chat-turned-off-backend`
+- [ ] The app's chat keeps a turned-off AI as its saved choice and refuses every send; offer to
+      turn it on or choose another enabled AI
 - [x] Ctrl+V (Shift+Insert, Cmd+V) in a prompt box that takes pictures pastes a copied image (saved
       as a PNG) or copied picture files; attachments show as square picture tiles, the whole
       picture on hover, decoded on a worker

@@ -299,21 +299,7 @@ fn read_u16_be(data: &[u8], off: usize) -> Option<u16> {
 
 /// A SQLite big-endian varint (up to 9 bytes): (value, bytes consumed).
 fn varint(data: &[u8], off: usize) -> Option<(u64, usize)> {
-    let mut result: u64 = 0;
-    let mut i = 0usize;
-    while i < 9 {
-        let b = *data.get(off.checked_add(i)?)?;
-        if i == 8 {
-            result = (result << 8) | u64::from(b);
-            return Some((result, 9));
-        }
-        result = (result << 7) | u64::from(b & 0x7f);
-        if b & 0x80 == 0 {
-            return Some((result, i + 1));
-        }
-        i += 1;
-    }
-    None
+    craft_sqlite::read_varint(data.get(off..)?).ok()
 }
 
 fn version_string(n: u32) -> String {
@@ -876,12 +862,9 @@ fn parse_record(payload: &[u8], text_encoding: &str, text_cap: usize) -> Vec<Cel
 
 /// Decode one serial-typed value at `off`; returns the value and its byte size.
 fn decode_serial(serial: u64, data: &[u8], off: usize, text_encoding: &str, text_cap: usize) -> (CellValue, usize) {
-    let size = match serial {
-        1..=4 => serial as usize,
-        5 => 6,
-        6 | 7 => 8,
-        n if n >= 12 => usize::try_from((n - 12) / 2).unwrap_or(usize::MAX),
-        _ => 0,
+    let size = match craft_sqlite::serial_type_len(serial) {
+        Ok(len) => usize::try_from(len).unwrap_or(usize::MAX),
+        Err(_) => 0,
     };
     if off > data.len() || (off == data.len() && size != 0) {
         return (CellValue::NotRead, size);

@@ -26,6 +26,8 @@ craft-plist = { workspace = true }
 craft-zip = { workspace = true }
 craft-tar = { workspace = true }
 craft-pkcs7 = { workspace = true }
+craft-sqlite = { workspace = true }
+craft-dds = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
