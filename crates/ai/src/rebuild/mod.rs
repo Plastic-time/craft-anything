@@ -756,25 +756,51 @@ impl Worker {
         Ok(())
     }
 
+    /// Close `session`'s open project if it still points at `inv`.
+    fn close_matching_project(session: &mut craft_anything_engine::Session, inv: &Path) {
+        if session.project.as_ref().is_some_and(|p| craft_anything_engine::workspace::normalized(&p.root) == inv) {
+            session.close_project();
+        }
+    }
+
     /// Detach this workspace's investigation project from the app's shared session (without
-    /// disturbing any different project opened in the meantime) and clean up this run's own engine
-    /// when a build finishes (#2341).
+    /// blocking build completion if another tool holds the app's session) and clean up this run's
+    /// own engine when a build finishes (#2341).
     fn detach(&self, ws: &Workspace) {
+        let _ = self.detach_with_pending(ws);
+    }
+
+    /// As [`Worker::detach`], returning the deferred-detach thread handle when the app's session
+    /// was busy and cleanup was handed to a background thread.
+    fn detach_with_pending(&self, ws: &Workspace) -> Option<std::thread::JoinHandle<()>> {
         let inv = craft_anything_engine::workspace::normalized(&ws.investigation_dir());
-        if let Some(app) = self.engine.app() {
-            let mut s = app.session();
-            if s.project.as_ref().is_some_and(|p| craft_anything_engine::workspace::normalized(&p.root) == inv) {
-                s.close_project();
+        let pending = if let Some(app) = self.engine.app() {
+            if let Some(mut s) = app.try_session() {
+                Self::close_matching_project(&mut s, &inv);
+                None
+            } else {
+                let inv_bg = inv.clone();
+                match std::thread::Builder::new().name("rebuild-detach".into()).spawn(move || {
+                    let mut s = app.session();
+                    Self::close_matching_project(&mut s, &inv_bg);
+                }) {
+                    Ok(handle) => Some(handle),
+                    Err(e) => {
+                        log::warn!("Couldn't spawn rebuild-detach thread: {e}");
+                        None
+                    }
+                }
             }
-        }
+        } else {
+            None
+        };
         let mut s = self.engine.session();
-        if s.project.as_ref().is_some_and(|p| craft_anything_engine::workspace::normalized(&p.root) == inv) {
-            s.close_project();
-        }
+        Self::close_matching_project(&mut s, &inv);
         let inbox = craft_anything_engine::workspace::normalized(&ws.inbox_dir());
         if s.ext.get::<InboxDir>().is_some_and(|cur| craft_anything_engine::workspace::normalized(&cur.0) == inbox) {
             s.ext.remove::<InboxDir>();
         }
+        pending
     }
 
     /// The prompt for notes the person added while the agent worked, if there are any, and the

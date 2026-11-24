@@ -5227,3 +5227,66 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
         "AiHub::start_detached created a fresh session investigation: {current:?}"
     );
 }
+
+/// #2341 review: when another thread holds the app's session lock, `Worker::detach` returns
+/// immediately without blocking build completion and hands app-session cleanup to a background
+/// thread that closes A once released, or leaves B untouched if the app switched projects first.
+#[test]
+fn detach_does_not_block_when_app_session_is_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Engine::shared(craft_anything_engine::Session::isolated(&dir.path().join("app-cfg")), Vec::new());
+    let ws_a = Workspace::create(dir.path(), "ProjectA", "Build A", TargetRef::None).unwrap();
+    let ws_b = Workspace::create(dir.path(), "ProjectB", "Build B", TargetRef::None).unwrap();
+
+    let mut worker_a = check_worker(&ws_a, false);
+    worker_a.engine = app.for_a_run(craft_anything_engine::testing::session);
+
+    // 1. Busy app session holding A: detach returns immediately (does not deadlock against the
+    //    lock holder) and the deferred thread closes A once the lock is released.
+    worker_a.attach(&ws_a).unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let app_holder = app.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = app_holder.session();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let pending = worker_a.detach_with_pending(&ws_a);
+    assert!(pending.is_some(), "busy app session defers detach to a background thread");
+    assert!(worker_a.engine.session().project.is_none(), "run engine still detaches synchronously");
+    assert!(worker_a.engine.session().ext.get::<InboxDir>().is_none(), "run engine inbox still clears synchronously");
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    pending.unwrap().join().unwrap();
+    assert!(app.session().project.is_none(), "deferred detach closed A once app session was released");
+
+    // 2. Busy app session switches to B before releasing: deferred detach leaves B untouched.
+    worker_a.attach(&ws_a).unwrap();
+    let project_b = Project::create(&ws_b.investigation_dir(), "ProjectB", Purpose::default()).unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let app_holder = app.clone();
+    let holder = std::thread::spawn(move || {
+        let mut guard = app_holder.session();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        guard.open_project(project_b).unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let pending = worker_a.detach_with_pending(&ws_a);
+    assert!(pending.is_some(), "busy app session defers detach while B switch is pending");
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    pending.unwrap().join().unwrap();
+    assert_eq!(
+        app.session().project.as_ref().map(|p| p.root.clone()),
+        Some(ws_b.investigation_dir()),
+        "deferred detach must not close project B opened while app session was busy"
+    );
+}
