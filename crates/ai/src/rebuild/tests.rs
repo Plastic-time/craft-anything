@@ -4818,18 +4818,36 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
     );
     assert!(journal_text(&ws_b.investigation_dir()).contains("Keep in project B"), "project B chat writes into B's journal");
 
-    // 4. Starting an API "Just look inside" chat (`detach_workspace_investigation: true`) while
-    //    build B's investigation is still attached detaches B BEFORE journaling user_message or
-    //    reading investigation state.
+    // 4a. While build B is still active (`Worker::attach` set B's `InboxDir`), starting a
+    //     "Just look inside" API chat must not yank B's investigation out from under the builder.
+    run_turn(true, "Question while build B runs");
+    assert_eq!(
+        worker.engine.session().project.as_ref().map(|p| p.root.clone()),
+        Some(ws_b.investigation_dir()),
+        "active build B's investigation stays attached while its build is running"
+    );
+    assert_eq!(
+        worker.engine.session().ext.get::<InboxDir>().map(|i| i.0.clone()),
+        Some(ws_b.inbox_dir()),
+        "active build B's inbox stays attached while its build is running"
+    );
+
+    // 4b. Once build B is no longer running (its `InboxDir` is detached), starting an API
+    //     "Just look inside" chat (`detach_workspace_investigation: true`) detaches any
+    //     still-open workspace investigation BEFORE journaling user_message or reading state.
+    worker.detach(&ws_b);
+    let project_b = Project::open(&ws_b.investigation_dir()).unwrap();
+    worker.engine.session().open_project(project_b).unwrap();
     run_turn(true, "Unrelated Just look inside question");
-    assert!(worker.engine.session().project.is_none(), "API Just look inside chat detached build B's investigation");
+    assert!(worker.engine.session().project.is_none(), "API Just look inside chat detached idle build B's investigation");
     assert!(
         !journal_text(&ws_b.investigation_dir()).contains("Unrelated Just look inside question"),
         "Just look inside user_message must not leak into build B's journal"
     );
 
     // 5. End-to-end `RebuildRun::start` thread exit calls `ctx.detach(&ws)` even when the build
-    //    fails/stops, and `AiHub::start_detached` detaches a build workspace for AgentCli chats.
+    //    fails before reaching `ctx.attach(&ws)`, and `AiHub::start_detached` detaches a build
+    //    workspace for AgentCli chats.
     let cfg_dir = dir.path().join("hub-cfg");
     let engine = Arc::new(Engine::new(craft_anything_engine::Session::isolated(&cfg_dir)));
     let hub = crate::AiHub::with_stores(engine.clone(), cfg_dir.join("config.toml"), crate::KeyStore::file_only(cfg_dir.join("keys.toml")));
@@ -4839,6 +4857,18 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
     )
     .unwrap();
     hub.set_command("MissingCli", Some("definitely-missing-copilot-for-detach-test")).unwrap();
+    // Pre-attach ws_a's investigation and InboxDir before `RebuildRun::start` so the post-run
+    // assertions prove `ctx.detach(&ws)` ran on thread exit even when the run aborts early
+    // (for instance, when `craft-anything-cli` is not present).
+    {
+        let project_a =
+            Project::open(&ws_a.investigation_dir()).or_else(|_| Project::create(&ws_a.investigation_dir(), "ProjectA", Purpose::default())).unwrap();
+        let mut s = engine.session();
+        s.open_project(project_a).unwrap();
+        s.ext.insert(Arc::new(InboxDir(ws_a.inbox_dir())));
+    }
+    assert_eq!(engine.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
+    assert_eq!(engine.session().ext.get::<InboxDir>().map(|i| i.0.clone()), Some(ws_a.inbox_dir()));
     let run =
         RebuildRun::start(&hub, Workspace::open(&ws_a.root).unwrap(), RunOptions { backend: Some("MissingCli".into()), ..RunOptions::default() }).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

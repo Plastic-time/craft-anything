@@ -2459,19 +2459,22 @@ mod backend_snapshot_tests {
             let p = Project::open(&inv_a).or_else(|_| Project::create(&inv_a, "ProjectA", Purpose::default())).unwrap();
             engine.session().open_project(p).unwrap();
         };
-        let drain = |app: &mut CraftApp| {
+        let drain_job = |app: &mut CraftApp, target: u64| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while std::time::Instant::now() < deadline {
-                let done = app.jobs.poll();
-                if !done.is_empty() {
-                    for f in done {
-                        app.handle_done(f);
+                let mut hit = false;
+                for f in app.jobs.poll() {
+                    if f.job == target {
+                        hit = true;
                     }
+                    app.handle_done(f);
+                }
+                if hit {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            panic!("background job did not finish");
+            panic!("background job {target} did not finish");
         };
 
         let mut app = demo::app(engine.clone());
@@ -2481,13 +2484,15 @@ mod backend_snapshot_tests {
         let file_b = dir.path().join("other.bin");
         std::fs::write(&file_b, b"unrelated target B").unwrap();
         app.open_path(file_b);
-        drain(&mut app);
+        let open_job = app.jobs.list.last().expect("open_path spawned a job").id;
+        drain_job(&mut app, open_job);
         assert!(engine.session().project.is_none(), "open_path detached build workspace A");
 
         // 2. `run_tool("web_site_open", ..., Route::Chat)` detaches build workspace A.
         attach();
         app.run_tool("web_site_open", json!({"url": "not-a-valid-url"}), Route::Chat { intro: String::new(), cta: false }, Consent::NotAsked);
-        drain(&mut app);
+        let web_job = *app.chat_jobs.last().expect("web_site_open spawned a chat job");
+        drain_job(&mut app, web_job);
         assert!(engine.session().project.is_none(), "web_site_open chat entry detached build workspace A");
     }
 }

@@ -297,8 +297,8 @@ impl Session {
     }
 
     /// Detach the open project when it is a build workspace's `investigation.cany` store,
-    /// leaving standalone `.cany` projects untouched (#2341). Also clears a matching workspace
-    /// `InboxDir` if still present. Returns `true` if detached.
+    /// leaving standalone `.cany` projects and any workspace with an active build (matching
+    /// `InboxDir` still set by `Worker::attach`) untouched (#2341). Returns `true` if detached.
     pub fn detach_workspace_investigation(&mut self) -> bool {
         let Some(root) = self.project.as_ref().map(|p| p.root.clone()) else {
             return false;
@@ -306,13 +306,13 @@ impl Session {
         if !crate::workspace::is_workspace_investigation(&root) {
             return false;
         }
-        self.close_project();
         if let Some(parent) = crate::workspace::normalized(&root).parent() {
             let inbox = crate::workspace::normalized(&parent.join("inbox"));
             if self.ext.get::<crate::inbox::InboxDir>().is_some_and(|cur| crate::workspace::normalized(&cur.0) == inbox) {
-                self.ext.remove::<crate::inbox::InboxDir>();
+                return false;
             }
         }
+        self.close_project();
         true
     }
 
@@ -466,9 +466,16 @@ mod tests {
         let stale_inv = crate::tools::investigation_tools::Investigation { handoff: Some("Build A handoff".into()), ..Default::default() };
         crate::tools::investigation_tools::cache(&mut session, stale_inv);
 
-        assert!(session.detach_workspace_investigation(), "build workspace investigation is detached");
+        // While the workspace's build is active (its InboxDir is still attached), do not detach
+        // its investigation out from under the running builder.
+        assert!(!session.detach_workspace_investigation(), "active build workspace stays attached");
+        assert_eq!(session.project.as_ref().map(|p| &p.root), Some(&ws.investigation_dir()));
+        assert!(session.ext.get::<crate::inbox::InboxDir>().is_some(), "active build InboxDir stays attached");
+
+        // Once the build is no longer active (InboxDir removed), the workspace investigation detaches.
+        session.ext.remove::<crate::inbox::InboxDir>();
+        assert!(session.detach_workspace_investigation(), "idle build workspace investigation is detached");
         assert!(session.project.is_none());
-        assert!(session.ext.get::<crate::inbox::InboxDir>().is_none(), "matching workspace InboxDir is cleared too");
         assert!(ledger_ids(&session).is_empty());
         assert_eq!(session.unknowns().count(), 0);
         assert!(crate::tools::investigation_tools::cached(&session).handoff.is_none(), "cached investigation state is cleared");
