@@ -960,15 +960,15 @@ impl CraftApp {
                 bytes: t.target.bytes.clone(),
             })
             .collect();
+        let ledger_changed = self.view_dirty
+            || self.view.ledger_len != s.ledger_len()
+            || self.view.ledger.first().map(|e| &e.id) != s.ledger().next().map(|e| &e.id)
+            || self.view.project.as_deref() != s.project.as_ref().map(|p| p.meta.name.as_str());
         let view = SessionView {
             targets,
             active: s.active_id().cloned(),
             clean_room: s.clean_room(),
-            ledger: if self.view_dirty || self.view.ledger_len != s.ledger_len() {
-                s.ledger().take(LEDGER_VIEW_CAP).cloned().collect()
-            } else {
-                std::mem::take(&mut self.view.ledger)
-            },
+            ledger: if ledger_changed { s.ledger().take(LEDGER_VIEW_CAP).cloned().collect() } else { std::mem::take(&mut self.view.ledger) },
             ledger_len: s.ledger_len(),
             unknowns: s.unknowns().take(500).cloned().collect(),
             findings: craft_anything_engine::tools::investigation_tools::cached(&s).findings,
@@ -2499,20 +2499,36 @@ mod backend_snapshot_tests {
                 .join("\n")
         };
 
-        // 1. `open_path` detaches build workspace A, and any follow-up `first_look` chat job
-        //    started in Beginner mode finishes before later steps re-attach A.
+        // 1. `open_path` detaches build workspace A on its own worker (verified before
+        //    `Done::Opened` runs `first_look`), and any follow-up `first_look` chat job started in
+        //    Beginner mode finishes before later steps re-attach A.
         attach();
         let file_b = dir.path().join("other.bin");
         std::fs::write(&file_b, b"unrelated target B").unwrap();
         let chat_before = app.chat_jobs.len();
         app.open_path(file_b);
         let open_job = app.jobs.list.last().expect("open_path spawned a job").id;
-        drain_jobs(&mut app, &[open_job]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut opened = None;
+        while opened.is_none() && std::time::Instant::now() < deadline {
+            for f in app.jobs.poll() {
+                if f.job == open_job {
+                    opened = Some(f);
+                } else {
+                    app.handle_done(f);
+                }
+            }
+            if opened.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let opened = opened.expect("open_path job finished");
+        assert!(engine.session().project.is_none(), "open_path worker detached build workspace A before first_look");
+        app.handle_done(opened);
         let follow_up: Vec<u64> = app.chat_jobs[chat_before..].to_vec();
         if !follow_up.is_empty() {
             drain_jobs(&mut app, &follow_up);
         }
-        assert!(engine.session().project.is_none(), "open_path detached build workspace A");
 
         // 2. `run_tool("web_site_open", ..., Route::Chat)` detaches build workspace A.
         attach();
@@ -2584,5 +2600,51 @@ mod backend_snapshot_tests {
             let journal = journal_of_a();
             assert!(!journal.contains(tool), "save_to({kind}) must not leak {tool} into A's journal: {journal}");
         }
+    }
+
+    /// #2341 review: `refresh_view` must reload the cached evidence ledger after detaching a build
+    /// project even when the new session records the same number of entries as the detached one.
+    #[test]
+    fn refresh_view_reloads_ledger_when_detached_project_has_same_entry_count() {
+        use craft_anything_engine::evidence::{Confidence, Environment, EvidenceBuilder, Subject};
+        use craft_anything_engine::project::{Project, Purpose};
+        use craft_anything_engine::workspace::{TargetRef, Workspace};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = craft_anything_engine::Session::isolated(&dir.path().join("cfg"));
+        session.settings.language = "en".into();
+        let engine = Arc::new(Engine::new(session));
+        let ws = Workspace::create(&dir.path().join("projects"), "ProjectA", "Build A", TargetRef::None).unwrap();
+        let inv_a = Project::create(&ws.investigation_dir(), "ProjectA", Purpose::default()).unwrap();
+        let make_ev = |tool: &str| {
+            EvidenceBuilder::new(tool, Subject { kind: "file".into(), sha256: None, name: Some(tool.into()) }, Environment::builtin(false))
+                .result(json!({"from": tool}))
+                .summary(tool)
+                .confidence(Confidence::Observed)
+                .build()
+                .unwrap()
+        };
+        let ev_a = make_ev("tool_from_project_a");
+        inv_a.store_evidence(&ev_a).unwrap();
+        engine.session().open_project(inv_a).unwrap();
+
+        let mut app = demo::app(engine.clone());
+        app.mark_dirty();
+        app.refresh_view();
+        assert_eq!(app.view.ledger.len(), 1);
+        assert_eq!(app.view.ledger[0].id, ev_a.id, "initial view shows project A's evidence");
+
+        // Detach project A and record 1 new evidence entry (same count as before) without marking
+        // `view_dirty`, simulating a periodic `refresh_view` after a detached worker call.
+        assert!(engine.session().detach_workspace_investigation());
+        let ev_b = make_ev("tool_after_detach");
+        engine.session().record(ev_b.clone()).unwrap();
+        assert!(!app.view_dirty);
+        app.last_view = Some(Instant::now() - Duration::from_secs(5));
+        app.refresh_view();
+
+        assert_eq!(app.view.ledger.len(), 1);
+        assert_eq!(app.view.ledger[0].id, ev_b.id, "refreshed view shows new evidence instead of detached project A's");
+        assert!(app.view.project.is_none());
     }
 }
