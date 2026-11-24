@@ -5290,3 +5290,37 @@ fn detach_does_not_block_when_app_session_is_busy() {
         "deferred detach must not close project B opened while app session was busy"
     );
 }
+
+/// #2341 review: when a tool thread still holds the run engine's own session lock as the build
+/// stops, `Worker::detach` also returns immediately and the deferred thread closes the project
+/// and clears `InboxDir` once the lock is released.
+#[test]
+fn detach_does_not_block_when_run_session_is_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Engine::shared(craft_anything_engine::Session::isolated(&dir.path().join("app-cfg")), Vec::new());
+    let ws_a = Workspace::create(dir.path(), "ProjectA", "Build A", TargetRef::None).unwrap();
+
+    let mut worker_a = check_worker(&ws_a, false);
+    worker_a.engine = app.for_a_run(craft_anything_engine::testing::session);
+    worker_a.attach(&ws_a).unwrap();
+
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let run_holder = worker_a.engine.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = run_holder.session();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let pending = worker_a.detach_with_pending(&ws_a);
+    assert!(pending.is_some(), "busy run session defers detach to a background thread");
+    assert!(app.session().project.is_none(), "free app session still detaches synchronously");
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    pending.unwrap().join().unwrap();
+    assert!(worker_a.engine.session().project.is_none(), "deferred detach closed A on the run engine");
+    assert!(worker_a.engine.session().ext.get::<InboxDir>().is_none(), "deferred detach removed InboxDir on the run engine");
+}

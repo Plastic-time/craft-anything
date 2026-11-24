@@ -756,51 +756,54 @@ impl Worker {
         Ok(())
     }
 
-    /// Close `session`'s open project if it still points at `inv`.
-    fn close_matching_project(session: &mut craft_anything_engine::Session, inv: &Path) {
+    /// Close `session`'s open project if it still points at `inv`, and (when `inbox` is given)
+    /// remove `InboxDir` if it still points at `inbox`.
+    fn detach_session(session: &mut craft_anything_engine::Session, inv: &Path, inbox: Option<&Path>) {
         if session.project.as_ref().is_some_and(|p| craft_anything_engine::workspace::normalized(&p.root) == inv) {
             session.close_project();
         }
+        if let Some(inbox) = inbox
+            && session.ext.get::<InboxDir>().is_some_and(|cur| craft_anything_engine::workspace::normalized(&cur.0) == inbox)
+        {
+            session.ext.remove::<InboxDir>();
+        }
     }
 
-    /// Detach this workspace's investigation project from the app's shared session (without
-    /// blocking build completion if another tool holds the app's session) and clean up this run's
-    /// own engine when a build finishes (#2341).
+    /// Detach this workspace's investigation project from the app's shared session and clean up
+    /// this run's own engine when a build finishes, without blocking build completion if another
+    /// tool still holds either session (#2341).
     fn detach(&self, ws: &Workspace) {
         let _ = self.detach_with_pending(ws);
     }
 
     /// As [`Worker::detach`], returning the deferred-detach thread handle when the app's session
-    /// was busy and cleanup was handed to a background thread.
+    /// or this run's session was busy and cleanup was handed to a background thread.
     fn detach_with_pending(&self, ws: &Workspace) -> Option<std::thread::JoinHandle<()>> {
         let inv = craft_anything_engine::workspace::normalized(&ws.investigation_dir());
-        let pending = if let Some(app) = self.engine.app() {
-            if let Some(mut s) = app.try_session() {
-                Self::close_matching_project(&mut s, &inv);
-                None
-            } else {
-                let inv_bg = inv.clone();
-                match std::thread::Builder::new().name("rebuild-detach".into()).spawn(move || {
-                    let mut s = app.session();
-                    Self::close_matching_project(&mut s, &inv_bg);
-                }) {
-                    Ok(handle) => Some(handle),
-                    Err(e) => {
-                        log::warn!("Couldn't spawn rebuild-detach thread: {e}");
-                        None
-                    }
-                }
-            }
-        } else {
-            None
-        };
-        let mut s = self.engine.session();
-        Self::close_matching_project(&mut s, &inv);
         let inbox = craft_anything_engine::workspace::normalized(&ws.inbox_dir());
-        if s.ext.get::<InboxDir>().is_some_and(|cur| craft_anything_engine::workspace::normalized(&cur.0) == inbox) {
-            s.ext.remove::<InboxDir>();
+        let mut deferred: Vec<(Arc<Engine>, Option<PathBuf>)> = Vec::new();
+        for (engine, inbox) in self.engine.app().into_iter().map(|e| (e, None)).chain(std::iter::once((self.engine.clone(), Some(inbox)))) {
+            if let Some(mut s) = engine.try_session() {
+                Self::detach_session(&mut s, &inv, inbox.as_deref());
+            } else {
+                deferred.push((engine, inbox));
+            }
         }
-        pending
+        if deferred.is_empty() {
+            return None;
+        }
+        match std::thread::Builder::new().name("rebuild-detach".into()).spawn(move || {
+            for (engine, inbox) in deferred {
+                let mut s = engine.session();
+                Self::detach_session(&mut s, &inv, inbox.as_deref());
+            }
+        }) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                log::warn!("Couldn't spawn rebuild-detach thread: {e}");
+                None
+            }
+        }
     }
 
     /// The prompt for notes the person added while the agent worked, if there are any, and the
