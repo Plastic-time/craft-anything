@@ -2695,6 +2695,91 @@ mod backend_snapshot_tests {
         assert!(app.view.project.is_none());
     }
 
+    /// Local loopback HTTP server that answers every request with HTTP 500 so `ApiConversation`
+    /// finishes a turn quickly without depending on closed-port timeout behaviour.
+    struct MockApiServer {
+        base_url: String,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockApiServer {
+        fn start() -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_flag = stop.clone();
+            let thread = std::thread::spawn(move || {
+                while !stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let (mut got, mut buf) = (Vec::new(), [0u8; 4096]);
+                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => got.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = stream.flush();
+                }
+            });
+            Self { base_url: format!("http://{addr}/v1"), stop, thread: Some(thread) }
+        }
+    }
+
+    impl Drop for MockApiServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Build a headless `CraftApp` pointed at `server` with isolated English settings.
+    fn make_local_api_app(cfg_dir: &std::path::Path, mode: Mode, server: &MockApiServer) -> (Arc<Engine>, CraftApp) {
+        let mut session = craft_anything_engine::Session::isolated(cfg_dir);
+        session.settings.mode = mode;
+        session.settings.language = "en".into();
+        let engine = Arc::new(Engine::new(session));
+        let mut app = demo::app(engine.clone());
+        let cfg = BackendConfig {
+            name: "LocalBox".into(),
+            kind: craft_anything_ai::BackendKind::OpenaiCompatible,
+            model: "m".into(),
+            base_url: Some(server.base_url.clone()),
+            ssh_host: None,
+            enabled: true,
+        };
+        app.hub.add_backend(cfg, None).unwrap();
+        app.state.backend = Some("LocalBox".into());
+        (engine, app)
+    }
+
+    /// Poll `app`'s active conversation until the current turn finishes (up to 30s).
+    fn wait_turn(app: &mut CraftApp) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            app.poll_conversation();
+            if !app.answering() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("conversation did not finish turn");
+    }
+
     /// #2341 review: sending from the Experienced workbench console (`detach_workspace = false`)
     /// keeps build project A attached, while sending from Beginner Ask (`detach_workspace = true`)
     /// detaches A.
@@ -2703,45 +2788,19 @@ mod backend_snapshot_tests {
         use craft_anything_engine::project::{Project, Purpose};
         use craft_anything_engine::workspace::{TargetRef, Workspace};
 
+        let server = MockApiServer::start();
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::create(&dir.path().join("projects"), "ProjectA", "Build A", TargetRef::None).unwrap();
         let inv_a = ws.investigation_dir();
-        let make_app = |mode: Mode| {
-            let mut session = craft_anything_engine::Session::isolated(&dir.path().join(format!("cfg-{mode:?}")));
-            session.settings.mode = mode;
-            session.settings.language = "en".into();
+        let make_attached = |mode: Mode| {
+            let (engine, app) = make_local_api_app(&dir.path().join(format!("cfg-{mode:?}")), mode, &server);
             let p = Project::open(&inv_a).or_else(|_| Project::create(&inv_a, "ProjectA", Purpose::default())).unwrap();
-            session.open_project(p).unwrap();
-            let engine = Arc::new(Engine::new(session));
-            let mut app = demo::app(engine.clone());
-            // Local closed-port API backend (same fixture as settings_ui::tests): starts a real
-            // ApiConversation and finishes quickly without leaving this machine.
-            let cfg = BackendConfig {
-                name: "LocalBox".into(),
-                kind: craft_anything_ai::BackendKind::OpenaiCompatible,
-                model: "m".into(),
-                base_url: Some("http://127.0.0.1:9/v1".into()),
-                ssh_host: None,
-                enabled: true,
-            };
-            app.hub.add_backend(cfg, None).unwrap();
-            app.state.backend = Some("LocalBox".into());
+            engine.session().open_project(p).unwrap();
             (engine, app)
-        };
-        let wait_turn = |app: &mut CraftApp| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while std::time::Instant::now() < deadline {
-                app.poll_conversation();
-                if !app.answering() {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            panic!("conversation did not finish turn");
         };
 
         // 1. Experienced workbench console path keeps build project A attached.
-        let (wb_engine, mut wb_app) = make_app(Mode::Experienced);
+        let (wb_engine, mut wb_app) = make_attached(Mode::Experienced);
         wb_app.send("Inspect build project A", false);
         wait_turn(&mut wb_app);
         assert_eq!(
@@ -2751,7 +2810,7 @@ mod backend_snapshot_tests {
         );
 
         // 2. Beginner Ask ("Just look inside") path detaches build project A.
-        let (ask_engine, mut ask_app) = make_app(Mode::Beginner);
+        let (ask_engine, mut ask_app) = make_attached(Mode::Beginner);
         ask_app.send("Look inside something else", true);
         wait_turn(&mut ask_app);
         assert!(ask_engine.session().project.is_none(), "Beginner Ask chat must detach build project A");
@@ -2765,6 +2824,7 @@ mod backend_snapshot_tests {
         use craft_anything_engine::project::{Project, Purpose};
         use craft_anything_engine::workspace::{TargetRef, Workspace};
 
+        let server = MockApiServer::start();
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::create(&dir.path().join("projects"), "ProjectA", "Build A", TargetRef::None).unwrap();
         let inv_a = ws.investigation_dir();
@@ -2772,37 +2832,9 @@ mod backend_snapshot_tests {
             let p = Project::open(&inv_a).or_else(|_| Project::create(&inv_a, "ProjectA", Purpose::default())).unwrap();
             engine.session().open_project(p).unwrap();
         };
-        let make_app = |tag: &str| {
-            let mut session = craft_anything_engine::Session::isolated(&dir.path().join(format!("cfg-{tag}")));
-            session.settings.language = "en".into();
-            let engine = Arc::new(Engine::new(session));
-            let mut app = demo::app(engine.clone());
-            let cfg = BackendConfig {
-                name: "LocalBox".into(),
-                kind: craft_anything_ai::BackendKind::OpenaiCompatible,
-                model: "m".into(),
-                base_url: Some("http://127.0.0.1:9/v1".into()),
-                ssh_host: None,
-                enabled: true,
-            };
-            app.hub.add_backend(cfg, None).unwrap();
-            app.state.backend = Some("LocalBox".into());
-            (engine, app)
-        };
-        let wait_turn = |app: &mut CraftApp| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while std::time::Instant::now() < deadline {
-                app.poll_conversation();
-                if !app.answering() {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            panic!("conversation did not finish turn");
-        };
 
         // 1. Ask (detached) -> attach A -> workbench (attached): A must stay attached and chat stays intact.
-        let (engine1, mut app1) = make_app("ask-to-wb");
+        let (engine1, mut app1) = make_local_api_app(&dir.path().join("cfg-ask-to-wb"), Mode::Beginner, &server);
         app1.send("First ask", true);
         wait_turn(&mut app1);
         attach(&engine1);
@@ -2819,7 +2851,7 @@ mod backend_snapshot_tests {
         );
 
         // 2. Workbench (attached) -> attach A -> Ask (detached): A must be detached and chat stays intact.
-        let (engine2, mut app2) = make_app("wb-to-ask");
+        let (engine2, mut app2) = make_local_api_app(&dir.path().join("cfg-wb-to-ask"), Mode::Experienced, &server);
         app2.send("First workbench", false);
         wait_turn(&mut app2);
         attach(&engine2);
