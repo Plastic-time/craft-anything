@@ -476,6 +476,8 @@ pub struct CraftApp {
     pub view: SessionView,
     pub jobs: jobs::Jobs<Done>,
     pub conversation: Option<Box<dyn Conversation>>,
+    /// Whether `conversation` was started with workspace detachment (Beginner Ask vs workbench).
+    conversation_detaches: bool,
     pub backends: Vec<BackendConfig>,
     /// Each backend's options (an agent app's program and model), by name (Settings → AI).
     pub backend_options: std::collections::BTreeMap<String, craft_anything_ai::BackendOptions>,
@@ -636,6 +638,7 @@ impl CraftApp {
             view: SessionView::default(),
             jobs: jobs::Jobs::default(),
             conversation: None,
+            conversation_detaches: false,
             backends: Vec::new(),
             backend_options: Default::default(),
             program_replaced: Default::default(),
@@ -1466,6 +1469,12 @@ impl CraftApp {
             // doesn't take over (and stop) the answer.
             self.backend_choices = self.backend_choices.wrapping_add(1);
         }
+        if self.conversation.is_some()
+            && self.conversation_detaches != detach_workspace
+            && let Some(mut c) = self.conversation.take()
+        {
+            c.stop();
+        }
         if self.state.backend.is_some() && self.conversation.is_none() {
             let started = if detach_workspace {
                 self.hub.start_detached(self.state.backend.as_deref(), self.beginner())
@@ -1473,7 +1482,10 @@ impl CraftApp {
                 self.hub.start(self.state.backend.as_deref(), self.beginner())
             };
             match started {
-                Ok(c) => self.conversation = Some(c),
+                Ok(c) => {
+                    self.conversation = Some(c);
+                    self.conversation_detaches = detach_workspace;
+                }
                 // The AI that was picked didn't start (it may be turned off), so the error is the
                 // answer; an AI is set up, so the built-in engines' "no AI brain" line would be wrong.
                 Err(e) => {
@@ -2511,6 +2523,7 @@ mod backend_snapshot_tests {
         };
 
         let mut app = demo::app(engine.clone());
+        // Deep mode lets core_target_open load file_b instead of being refused by Clean room.
         demo::deep(&mut app);
         let journal_of_a = || {
             std::fs::read_dir(inv_a.join("journal"))
@@ -2742,5 +2755,80 @@ mod backend_snapshot_tests {
         ask_app.send("Look inside something else", true);
         wait_turn(&mut ask_app);
         assert!(ask_engine.session().project.is_none(), "Beginner Ask chat must detach build project A");
+    }
+
+    /// #2341 review: switching between Beginner Ask (`detach_workspace = true`) and the
+    /// Experienced workbench console (`detach_workspace = false`) on the same `CraftApp` replaces
+    /// the active conversation with the matching mode without clearing `state.chat`.
+    #[test]
+    fn send_switches_conversation_when_detach_mode_changes() {
+        use craft_anything_engine::project::{Project, Purpose};
+        use craft_anything_engine::workspace::{TargetRef, Workspace};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(&dir.path().join("projects"), "ProjectA", "Build A", TargetRef::None).unwrap();
+        let inv_a = ws.investigation_dir();
+        let attach = |engine: &Arc<Engine>| {
+            let p = Project::open(&inv_a).or_else(|_| Project::create(&inv_a, "ProjectA", Purpose::default())).unwrap();
+            engine.session().open_project(p).unwrap();
+        };
+        let make_app = |tag: &str| {
+            let mut session = craft_anything_engine::Session::isolated(&dir.path().join(format!("cfg-{tag}")));
+            session.settings.language = "en".into();
+            let engine = Arc::new(Engine::new(session));
+            let mut app = demo::app(engine.clone());
+            let cfg = BackendConfig {
+                name: "LocalBox".into(),
+                kind: craft_anything_ai::BackendKind::OpenaiCompatible,
+                model: "m".into(),
+                base_url: Some("http://127.0.0.1:9/v1".into()),
+                ssh_host: None,
+                enabled: true,
+            };
+            app.hub.add_backend(cfg, None).unwrap();
+            app.state.backend = Some("LocalBox".into());
+            (engine, app)
+        };
+        let wait_turn = |app: &mut CraftApp| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                app.poll_conversation();
+                if !app.answering() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("conversation did not finish turn");
+        };
+
+        // 1. Ask (detached) -> attach A -> workbench (attached): A must stay attached and chat stays intact.
+        let (engine1, mut app1) = make_app("ask-to-wb");
+        app1.send("First ask", true);
+        wait_turn(&mut app1);
+        attach(&engine1);
+        app1.send("Continue in workbench", false);
+        wait_turn(&mut app1);
+        assert_eq!(
+            engine1.session().project.as_ref().map(|p| p.root.clone()),
+            Some(inv_a.clone()),
+            "switching from Ask to workbench chat must keep build project A attached"
+        );
+        assert!(
+            app1.state.chat.iter().any(|item| matches!(item, ChatItem::User(t) if t == "First ask")),
+            "switching conversation mode must not clear existing chat history"
+        );
+
+        // 2. Workbench (attached) -> attach A -> Ask (detached): A must be detached and chat stays intact.
+        let (engine2, mut app2) = make_app("wb-to-ask");
+        app2.send("First workbench", false);
+        wait_turn(&mut app2);
+        attach(&engine2);
+        app2.send("Switch to Ask", true);
+        wait_turn(&mut app2);
+        assert!(engine2.session().project.is_none(), "switching from workbench to Ask chat must detach build project A");
+        assert!(
+            app2.state.chat.iter().any(|item| matches!(item, ChatItem::User(t) if t == "First workbench")),
+            "switching conversation mode must not clear existing chat history"
+        );
     }
 }
