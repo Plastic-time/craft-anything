@@ -22,7 +22,7 @@ pub(crate) struct SharedConversation {
 }
 
 impl SharedConversation {
-    pub(crate) fn new(engine: Arc<Engine>, keys: crate::KeyStore, entry: BackendEntry, beginner: bool) -> Result<Self, ToolError> {
+    pub(crate) fn new(engine: Arc<Engine>, keys: crate::KeyStore, entry: BackendEntry, beginner: bool, detach_workspace: bool) -> Result<Self, ToolError> {
         let (commands, requests) = std::sync::mpsc::channel();
         let (output, events) = std::sync::mpsc::channel();
         let report = output.clone();
@@ -40,7 +40,7 @@ impl SharedConversation {
                             Ok(Command::Quit) | Err(RecvTimeoutError::Disconnected) => break,
                             Ok(Command::Send(text)) => {
                                 let _ = output.send(AgentEvent::Status { text: "Preparing the shared investigation...".into() });
-                                match prepare(&engine, &keys, &entry, beginner) {
+                                match prepare(&engine, &keys, &entry, beginner, detach_workspace) {
                                     Ok(mut spec) => {
                                         let next = json!({"project": spec.project, "targets": spec.targets, "deep": spec.deep, "options": spec.options});
                                         if context.as_ref() != Some(&next) {
@@ -134,10 +134,13 @@ fn continues(previous: Option<&Value>, next: &Value) -> bool {
     previous.get("project") == next.get("project") && (deep(next) || !deep(previous))
 }
 
-fn prepare(engine: &Engine, keys: &crate::KeyStore, entry: &BackendEntry, beginner: bool) -> Result<CliSpec, ToolError> {
+fn prepare(engine: &Engine, keys: &crate::KeyStore, entry: &BackendEntry, beginner: bool, detach_workspace: bool) -> Result<CliSpec, ToolError> {
     let mut session = engine.session();
     let config = crate::AiConfig::from_settings(&session.settings);
     let entry = config.get(&entry.config.name).unwrap_or(entry);
+    if detach_workspace {
+        session.detach_workspace_investigation();
+    }
     let project = session.ensure_shared_project()?;
     let targets = session.shared_targets();
     serde_json::to_value(&targets).map_err(|error| ToolError::invalid(format!("Couldn't share the target metadata: {error}")))?;
@@ -227,7 +230,7 @@ mod tests {
             options: BackendOptions::default(),
         };
         let keys = crate::KeyStore::file_only(directory.path().join("keys.toml"));
-        let spec = prepare(&engine, &keys, &entry, false).unwrap();
+        let spec = prepare(&engine, &keys, &entry, false, false).unwrap();
         assert_eq!(spec.key, None, "copilot is not a key-auth agent: the keychain is never asked");
         assert_eq!(spec.targets.len(), 2);
         assert_eq!(spec.targets.last().unwrap().path, first);
@@ -240,8 +243,65 @@ mod tests {
         let mut config = crate::AiConfig::default();
         config.upsert(updated);
         engine.session().settings.ai = config.to_table().unwrap();
-        let refreshed = prepare(&engine, &keys, &entry, false).unwrap();
+        let refreshed = prepare(&engine, &keys, &entry, false, false).unwrap();
         assert_eq!(refreshed.options.cli_context, Some(crate::config::CliContext::Long));
         assert_eq!(refreshed.options.cli_reasoning_effort, Some(crate::config::CliReasoningEffort::Max));
+    }
+
+    /// #2341: a chat explicitly started against project A's `investigation.cany` (`detach = false`,
+    /// e.g. `craft-anything-cli --project <A>/investigation.cany chat`) keeps writing to project A,
+    /// whereas a "Just look inside" chat (`detach = true`) detaches project A and creates its own
+    /// `investigations/session-*.cany` while leaving standalone `.cany` projects shared.
+    #[test]
+    fn just_look_inside_chat_does_not_reuse_a_build_projects_investigation() {
+        use craft_anything_engine::project::{Project, Purpose};
+        use craft_anything_engine::workspace::{TargetRef, Workspace};
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(craft_anything_engine::Session::isolated(dir.path()));
+
+        // Simulate project A having been built and its investigation attached to the session.
+        let projects_root = dir.path().join("projects");
+        let ws_a = Workspace::create(&projects_root, "Project A", "Build app A", TargetRef::None).unwrap();
+        let inv_a = ws_a.investigation_dir();
+        let project_a = Project::create(&inv_a, "Project A", Purpose::default()).unwrap();
+        let brief_a = inv_a.join("investigation").join("brief.md");
+        std::fs::create_dir_all(brief_a.parent().unwrap()).unwrap();
+        std::fs::write(&brief_a, "Project A brief").unwrap();
+        engine.session().open_project(project_a).unwrap();
+
+        let entry = BackendEntry {
+            config: BackendConfig { name: "Agent".into(), kind: BackendKind::AgentCli, model: "copilot".into(), base_url: None, ssh_host: None, enabled: true },
+            options: BackendOptions::default(),
+        };
+        let keys = crate::KeyStore::file_only(dir.path().join("keys.toml"));
+
+        // 1. Staying inside project A's own investigation (`detach_workspace = false`) keeps A attached.
+        let spec_in_a = prepare(&engine, &keys, &entry, false, false).unwrap();
+        assert_eq!(spec_in_a.project.as_ref(), Some(&inv_a), "explicitly chatting against project A keeps saving into project A");
+
+        // 2. Starting a "Just look inside" chat (`detach_workspace = true`) for an unrelated target B
+        //    must detach A and create its own `investigations/session-*.cany`.
+        let target_b = dir.path().join("app-b.bin");
+        std::fs::write(&target_b, b"binary B").unwrap();
+        engine.session().add_target(Target::load(&target_b).unwrap());
+
+        let spec = prepare(&engine, &keys, &entry, false, true).unwrap();
+
+        let chat_project = spec.project.as_ref().expect("chat has its own shared investigation");
+        assert_ne!(chat_project, &inv_a, "Just look inside must not reuse build project A's investigation.cany");
+        assert!(
+            chat_project.starts_with(dir.path().join("investigations")),
+            "chat investigation should live under investigations/, got {}",
+            chat_project.display()
+        );
+        assert_eq!(std::fs::read_to_string(&brief_a).unwrap(), "Project A brief", "project A's brief stays intact");
+
+        // 3. A standalone investigation opened directly (not inside a build workspace) stays shared.
+        let standalone_root = dir.path().join("custom.cany");
+        let standalone = Project::create(&standalone_root, "Standalone", Purpose::Education).unwrap();
+        engine.session().open_project(standalone).unwrap();
+        let spec_standalone = prepare(&engine, &keys, &entry, false, true).unwrap();
+        assert_eq!(spec_standalone.project.as_ref(), Some(&standalone_root), "non-workspace investigation stays shared");
     }
 }

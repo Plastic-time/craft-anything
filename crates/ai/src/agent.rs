@@ -52,6 +52,9 @@ pub trait ToolHost: Send + Sync {
     fn toolsets(&self) -> Vec<Toolset> {
         Toolset::ALL.to_vec()
     }
+    /// Detach a build workspace's `investigation.cany` from the engine session before a non-build
+    /// chat reads or writes investigation state (#2341).
+    fn detach_workspace_investigation(&self) {}
 }
 
 /// The real host: the engine.
@@ -139,6 +142,10 @@ impl ToolHost for EngineHost {
             }
             Err(e) => format!("(couldn't load: {})", e.message),
         }
+    }
+
+    fn detach_workspace_investigation(&self) {
+        self.0.session().detach_workspace_investigation();
     }
 
     fn clean_room(&self) -> bool {
@@ -284,12 +291,25 @@ pub struct LoopConfig {
     /// there are claimed and added after the results, so the builder reads them at its next step,
     /// as a coding agent's hook hands them over. `None`: notes wait for the turn to end.
     pub notes: Option<std::path::PathBuf>,
+    /// Detach any build workspace `investigation.cany` attached to the engine session before
+    /// reading or writing investigation state in this chat (#2341).
+    pub detach_workspace_investigation: bool,
 }
 
 impl Default for LoopConfig {
     /// Deep, so a conversation started without an explicit mode keeps the old, safe behavior.
     fn default() -> Self {
-        Self { beginner: false, prices: BTreeMap::new(), transcript: None, deep: true, context_tokens: 0, lean_for_local: false, logs: None, notes: None }
+        Self {
+            beginner: false,
+            prices: BTreeMap::new(),
+            transcript: None,
+            deep: true,
+            context_tokens: 0,
+            lean_for_local: false,
+            logs: None,
+            notes: None,
+            detach_workspace_investigation: false,
+        }
     }
 }
 
@@ -502,6 +522,9 @@ impl AgentLoop {
         self.stop.reset();
         let cancel = CancelToken::default();
         *self.cancel.lock().unwrap_or_else(PoisonError::into_inner) = cancel.clone();
+        if self.cfg.detach_workspace_investigation {
+            self.host.detach_workspace_investigation();
+        }
         if let Some(text) = text {
             self.host.journal("user_message", json!({"text": crate::journal_text(text)}));
         }
@@ -761,6 +784,9 @@ impl AgentLoop {
 
     /// The system prompt and tools for the backend now in use, its tool list chosen afresh.
     fn offer(&mut self) -> (String, Vec<ToolDef>) {
+        if self.cfg.detach_workspace_investigation {
+            self.host.detach_workspace_investigation();
+        }
         self.fit_system();
         (self.system.clone().unwrap_or_default(), self.tool_defs())
     }

@@ -4749,3 +4749,123 @@ fn a_new_build_stops_before_any_turn_when_its_stacks_program_is_missing() {
         assert_eq!(stacks::missing_program(&s.name, |_| false).map(|(p, from)| (p, !from.is_empty())), Some(("cargo", true)), "{}", s.name);
     }
 }
+
+/// #2341: detaching a finished build releases its workspace investigation and inbox without
+/// disturbing a different project opened in the meantime, and an API "Just look inside" chat
+/// detaches a still-attached build workspace before reading or writing investigation state.
+#[test]
+fn build_detach_and_api_chat_keep_build_investigations_isolated() {
+    use crate::agent::tests::{Scripted, turn};
+    use crate::agent::{ApiConversation, EngineHost, LoopConfig, ModelSlot};
+    use crate::model::{Block, StopReason};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws_a = Workspace::create(dir.path(), "ProjectA", "Build A", TargetRef::None).unwrap();
+    let ws_b = Workspace::create(dir.path(), "ProjectB", "Build B", TargetRef::None).unwrap();
+    let worker = check_worker(&ws_a, false);
+
+    // 1. Finishing build A detaches A's investigation and inbox.
+    worker.attach(&ws_a).unwrap();
+    assert_eq!(worker.engine.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
+    assert!(worker.engine.session().ext.get::<InboxDir>().is_some());
+    worker.detach(&ws_a);
+    assert!(worker.engine.session().project.is_none(), "finished build detaches its investigation");
+    assert!(worker.engine.session().ext.get::<InboxDir>().is_none(), "finished build removes its inbox");
+
+    // 2. If another project is now open, detaching A must leave B untouched.
+    worker.attach(&ws_b).unwrap();
+    worker.detach(&ws_a);
+    assert_eq!(worker.engine.session().project.as_ref().map(|p| p.root.clone()), Some(ws_b.investigation_dir()));
+    assert_eq!(worker.engine.session().ext.get::<InboxDir>().map(|i| i.0.clone()), Some(ws_b.inbox_dir()));
+
+    // 3. An API chat targeting project B itself (`detach_workspace_investigation: false`, the
+    //    default used by builders and `craft-anything-cli --project <B>/investigation.cany chat`)
+    //    keeps B attached and writes its journal entry into B.
+    let journal_text = |root: &std::path::Path| {
+        let dir = root.join("journal");
+        let Ok(entries) = std::fs::read_dir(&dir) else { return String::new() };
+        entries.flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).collect::<Vec<_>>().join("\n")
+    };
+    let run_turn = |detach: bool, msg: &str| {
+        let seen = Arc::default();
+        let mut script = Scripted { turns: std::collections::VecDeque::new(), seen: Arc::clone(&seen) };
+        script.turns.push_back(turn(vec![Block::Text { text: "Looked inside.".into() }], StopReason::EndTurn));
+        let slot = ModelSlot {
+            name: "Scripted".into(),
+            model: Box::new(script),
+            local: false,
+            effort: None,
+            max_turns: 4,
+            context_tokens: 0,
+            tools: Default::default(),
+        };
+        let host = Arc::new(EngineHost(worker.engine.clone()));
+        let mut conv = ApiConversation::start(host, vec![slot], LoopConfig { detach_workspace_investigation: detach, ..LoopConfig::default() }).unwrap();
+        conv.send(msg);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if conv.poll().iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    run_turn(false, "Keep in project B");
+    assert_eq!(
+        worker.engine.session().project.as_ref().map(|p| p.root.clone()),
+        Some(ws_b.investigation_dir()),
+        "chat targeting project B keeps B's investigation attached"
+    );
+    assert!(journal_text(&ws_b.investigation_dir()).contains("Keep in project B"), "project B chat writes into B's journal");
+
+    // 4. Starting an API "Just look inside" chat (`detach_workspace_investigation: true`) while
+    //    build B's investigation is still attached detaches B BEFORE journaling user_message or
+    //    reading investigation state.
+    run_turn(true, "Unrelated Just look inside question");
+    assert!(worker.engine.session().project.is_none(), "API Just look inside chat detached build B's investigation");
+    assert!(
+        !journal_text(&ws_b.investigation_dir()).contains("Unrelated Just look inside question"),
+        "Just look inside user_message must not leak into build B's journal"
+    );
+
+    // 5. End-to-end `RebuildRun::start` thread exit calls `ctx.detach(&ws)` even when the build
+    //    fails/stops, and `AiHub::start_detached` detaches a build workspace for AgentCli chats.
+    let cfg_dir = dir.path().join("hub-cfg");
+    let engine = Arc::new(Engine::new(craft_anything_engine::Session::isolated(&cfg_dir)));
+    let hub = crate::AiHub::with_stores(engine.clone(), cfg_dir.join("config.toml"), crate::KeyStore::file_only(cfg_dir.join("keys.toml")));
+    hub.add_backend(
+        crate::BackendConfig { name: "MissingCli".into(), kind: BackendKind::AgentCli, model: "copilot".into(), base_url: None, ssh_host: None, enabled: true },
+        None,
+    )
+    .unwrap();
+    hub.set_command("MissingCli", Some("definitely-missing-copilot-for-detach-test")).unwrap();
+    let run =
+        RebuildRun::start(&hub, Workspace::open(&ws_a.root).unwrap(), RunOptions { backend: Some("MissingCli".into()), ..RunOptions::default() }).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while run.is_running() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    assert!(!run.is_running(), "missing-CLI build finished");
+    assert!(engine.session().project.is_none(), "RebuildRun::start thread exit detached ws_a's investigation");
+    assert!(engine.session().ext.get::<InboxDir>().is_none(), "RebuildRun::start thread exit detached ws_a's inbox");
+
+    // Attach ws_a again and verify `AiHub::start_detached` routes `detach_workspace = true`
+    // through `SharedConversation::new` -> `prepare`.
+    let project_a = Project::open(&ws_a.investigation_dir()).or_else(|_| Project::create(&ws_a.investigation_dir(), "ProjectA", Purpose::default())).unwrap();
+    engine.session().open_project(project_a).unwrap();
+    let mut detached_conv = hub.start_detached(Some("MissingCli"), false).unwrap();
+    detached_conv.send("Look inside something else");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if detached_conv.poll().iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    let current = engine.session().project.as_ref().map(|p| p.root.clone());
+    assert_ne!(current, Some(ws_a.investigation_dir()), "AiHub::start_detached must not keep ws_a attached");
+    assert!(
+        current.as_ref().is_some_and(|p| p.starts_with(cfg_dir.join("investigations"))),
+        "AiHub::start_detached created a fresh session investigation: {current:?}"
+    );
+}

@@ -1039,6 +1039,9 @@ impl CraftApp {
         self.log(false, format!("Running {id}"));
         let chat = matches!(route, Route::Chat { .. });
         let job = self.jobs.spawn(title, true, move |j| {
+            if chat && id == "web_site_open" {
+                engine.session().detach_workspace_investigation();
+            }
             let progress = j.reporter();
             let opts = CallOptions::new(Caller::Ui).with_consent(consent).with_cancel(j.cancel.clone()).with_progress(&progress);
             let result = engine.call(&id, params.clone(), opts);
@@ -1208,6 +1211,7 @@ impl CraftApp {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
         self.toast(i18n::trf("Opening {name}…", &[("name", &name)]), false);
         self.jobs.spawn(i18n::trf("Open {name}", &[("name", &name)]), true, move |j| {
+            engine.session().detach_workspace_investigation();
             let params = json!({"path": path.to_string_lossy()});
             let result = engine.call("core_target_open", params, CallOptions::new(Caller::Ui).with_cancel(j.cancel.clone())).map(|o| match o {
                 ToolOutput::Value(v) => v,
@@ -1432,7 +1436,7 @@ impl CraftApp {
             self.backend_choices = self.backend_choices.wrapping_add(1);
         }
         if self.state.backend.is_some() && self.conversation.is_none() {
-            match self.hub.start(self.state.backend.as_deref(), self.beginner()) {
+            match self.hub.start_detached(self.state.backend.as_deref(), self.beginner()) {
                 Ok(c) => self.conversation = Some(c),
                 // The AI that was picked didn't start (it may be turned off), so the error is the
                 // answer; an AI is set up, so the built-in engines' "no AI brain" line would be wrong.
@@ -2437,5 +2441,53 @@ mod backend_snapshot_tests {
         assert_eq!(app.backends.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["New"]);
         app.handle_done(jobs::Finished { job: 3, result: Ok(snapshot(11, "Newer")) });
         assert_eq!(app.backends.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["Newer"]);
+    }
+
+    /// #2341: opening a file (`open_path`) or website (`run_tool("web_site_open", Route::Chat)`)
+    /// from "Just look inside" detaches any build workspace's `investigation.cany` on the worker
+    /// thread before the tool runs.
+    #[test]
+    fn just_look_inside_open_path_and_web_site_open_detach_build_investigation() {
+        use craft_anything_engine::project::{Project, Purpose};
+        use craft_anything_engine::workspace::{TargetRef, Workspace};
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = demo::engine(Mode::Beginner, true);
+        let ws = Workspace::create(&dir.path().join("projects"), "ProjectA", "Build A", TargetRef::None).unwrap();
+        let inv_a = ws.investigation_dir();
+        let attach = || {
+            let p = Project::open(&inv_a).or_else(|_| Project::create(&inv_a, "ProjectA", Purpose::default())).unwrap();
+            engine.session().open_project(p).unwrap();
+        };
+        let drain = |app: &mut CraftApp| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                let done = app.jobs.poll();
+                if !done.is_empty() {
+                    for f in done {
+                        app.handle_done(f);
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("background job did not finish");
+        };
+
+        let mut app = demo::app(engine.clone());
+
+        // 1. `open_path` detaches build workspace A.
+        attach();
+        let file_b = dir.path().join("other.bin");
+        std::fs::write(&file_b, b"unrelated target B").unwrap();
+        app.open_path(file_b);
+        drain(&mut app);
+        assert!(engine.session().project.is_none(), "open_path detached build workspace A");
+
+        // 2. `run_tool("web_site_open", ..., Route::Chat)` detaches build workspace A.
+        attach();
+        app.run_tool("web_site_open", json!({"url": "not-a-valid-url"}), Route::Chat { intro: String::new(), cta: false }, Consent::NotAsked);
+        drain(&mut app);
+        assert!(engine.session().project.is_none(), "web_site_open chat entry detached build workspace A");
     }
 }

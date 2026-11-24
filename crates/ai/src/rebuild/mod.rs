@@ -363,6 +363,7 @@ impl RebuildRun {
                     ctx.run(&mut ws, entry, api, extractor, kept_without_api, &opts)
                 }));
                 let (ok, message, paused) = run_outcome(result, &mut ws);
+                ctx.detach(&ws);
                 ctx.record_usage(None);
                 // The CLI can exit as soon as it sees completion: release the helper while its
                 // supervisor threads are still available to stop it.
@@ -692,6 +693,20 @@ impl Worker {
         s.open_project(project)?;
         s.ext.insert(Arc::new(InboxDir(ws.inbox_dir())));
         Ok(())
+    }
+
+    /// Detach this workspace's investigation project and inbox from the shared engine session
+    /// when a build finishes, without disturbing any different project opened in the meantime (#2341).
+    fn detach(&self, ws: &Workspace) {
+        let mut s = self.engine.session();
+        let inv = craft_anything_engine::workspace::normalized(&ws.investigation_dir());
+        if s.project.as_ref().is_some_and(|p| craft_anything_engine::workspace::normalized(&p.root) == inv) {
+            s.close_project();
+        }
+        let inbox = craft_anything_engine::workspace::normalized(&ws.inbox_dir());
+        if s.ext.get::<InboxDir>().is_some_and(|cur| craft_anything_engine::workspace::normalized(&cur.0) == inbox) {
+            s.ext.remove::<InboxDir>();
+        }
     }
 
     /// The prompt for notes the person added while the agent worked, if there are any, and the

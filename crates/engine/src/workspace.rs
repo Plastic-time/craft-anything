@@ -713,6 +713,13 @@ pub fn normalized(path: &Path) -> PathBuf {
     out
 }
 
+/// Whether `path` is the `investigation.cany` store inside a build project workspace
+/// (a folder named `investigation.cany` whose parent contains `craft.json`).
+pub fn is_workspace_investigation(path: &Path) -> bool {
+    let norm = normalized(path);
+    norm.file_name().is_some_and(|n| n == "investigation.cany") && norm.parent().is_some_and(|p| p.join(MANIFEST).is_file())
+}
+
 /// A folder-name slug: lower-case words joined by dashes, at most 40 characters.
 pub fn slug(s: &str) -> String {
     let mut out = String::new();

@@ -1194,7 +1194,18 @@ impl AiHub {
     }
 
     /// Start a conversation with the lead backend (or the named one, while it is enabled).
+    /// Keeps any explicitly opened project attached (e.g. `craft-anything-cli --project <dir> chat`).
     pub fn start(&self, backend: Option<&str>, beginner: bool) -> Result<Box<dyn Conversation>, ToolError> {
+        self.start_with_mode(backend, beginner, false)
+    }
+
+    /// Start a "Just look inside" conversation that detaches any build workspace's
+    /// `investigation.cany` from the shared session before reading or writing investigation state (#2341).
+    pub fn start_detached(&self, backend: Option<&str>, beginner: bool) -> Result<Box<dyn Conversation>, ToolError> {
+        self.start_with_mode(backend, beginner, true)
+    }
+
+    fn start_with_mode(&self, backend: Option<&str>, beginner: bool, detach_workspace: bool) -> Result<Box<dyn Conversation>, ToolError> {
         let cfg = self.config();
         let first = match backend {
             Some(n) => Self::entry_on(&cfg, n)?,
@@ -1203,14 +1214,14 @@ impl AiHub {
                 .cloned()
                 .ok_or_else(|| ToolError::unavailable("No AI is set up yet.").with_remediation("Add one in Settings → AI."))?,
         };
-        self.start_selected(first, &cfg, beginner)
+        self.start_selected(first, &cfg, beginner, detach_workspace)
     }
 
     /// Start on an entry already chosen (and, when named, checked to be on), using the same
     /// configuration snapshot for its fallback chain.
-    fn start_selected(&self, first: BackendEntry, cfg: &AiConfig, beginner: bool) -> Result<Box<dyn Conversation>, ToolError> {
+    fn start_selected(&self, first: BackendEntry, cfg: &AiConfig, beginner: bool, detach_workspace: bool) -> Result<Box<dyn Conversation>, ToolError> {
         if first.config.kind == BackendKind::AgentCli {
-            return Ok(Box::new(cli_agents::SharedConversation::new(self.engine.clone(), self.keys.clone(), first, beginner)?));
+            return Ok(Box::new(cli_agents::SharedConversation::new(self.engine.clone(), self.keys.clone(), first, beginner, detach_workspace)?));
         }
         let mut chain = vec![self.build_model(&first)?];
         for name in cfg.chain_from(&first.config.name).into_iter().skip(1) {
@@ -1222,8 +1233,17 @@ impl AiHub {
             }
         }
         let host = Arc::new(EngineHost(self.engine.clone()));
-        let conv =
-            ApiConversation::start(host, chain, LoopConfig { beginner, prices: cfg.prices.clone(), logs: self.failure_logs(), ..LoopConfig::default() })?;
+        let conv = ApiConversation::start(
+            host,
+            chain,
+            LoopConfig {
+                beginner,
+                prices: cfg.prices.clone(),
+                logs: self.failure_logs(),
+                detach_workspace_investigation: detach_workspace,
+                ..LoopConfig::default()
+            },
+        )?;
         Ok(Box::new(conv))
     }
 
@@ -1284,7 +1304,7 @@ impl AiHub {
         let cfg = self.config();
         let a_entry = Self::entry_on(&cfg, a)?;
         let b_entry = Self::entry_on(&cfg, b)?;
-        Ok(vec![(a.to_string(), self.start_selected(a_entry, &cfg, beginner)?), (b.to_string(), self.start_selected(b_entry, &cfg, beginner)?)])
+        Ok(vec![(a.to_string(), self.start_selected(a_entry, &cfg, beginner, false)?), (b.to_string(), self.start_selected(b_entry, &cfg, beginner, false)?)])
     }
 
     /// Live model list for a backend. Blocking (bounded); run it off the UI thread.

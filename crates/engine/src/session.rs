@@ -288,6 +288,34 @@ impl Session {
         self.unloaded_evidence = 0;
     }
 
+    /// Detach any open project and clear its loaded ledger, open questions and cached
+    /// investigation state so subsequent session work starts clean.
+    pub fn close_project(&mut self) {
+        self.project = None;
+        self.clear_ledger();
+        crate::tools::investigation_tools::cache(self, crate::tools::investigation_tools::Investigation::default());
+    }
+
+    /// Detach the open project when it is a build workspace's `investigation.cany` store,
+    /// leaving standalone `.cany` projects untouched (#2341). Also clears a matching workspace
+    /// `InboxDir` if still present. Returns `true` if detached.
+    pub fn detach_workspace_investigation(&mut self) -> bool {
+        let Some(root) = self.project.as_ref().map(|p| p.root.clone()) else {
+            return false;
+        };
+        if !crate::workspace::is_workspace_investigation(&root) {
+            return false;
+        }
+        self.close_project();
+        if let Some(parent) = crate::workspace::normalized(&root).parent() {
+            let inbox = crate::workspace::normalized(&parent.join("inbox"));
+            if self.ext.get::<crate::inbox::InboxDir>().is_some_and(|cur| crate::workspace::normalized(&cur.0) == inbox) {
+                self.ext.remove::<crate::inbox::InboxDir>();
+            }
+        }
+        true
+    }
+
     // ---- unknowns ----
 
     pub fn unknowns(&self) -> impl Iterator<Item = &Unknown> {
@@ -414,5 +442,53 @@ mod tests {
         session.open_project(empty).unwrap();
         assert!(ledger_ids(&session).is_empty(), "a new project starts without evidence");
         assert_eq!(session.unknowns().count(), 0, "and without open questions");
+    }
+
+    /// #2341: detaching a build workspace's `investigation.cany` clears its loaded ledger,
+    /// unknowns and cached investigation state so a later shared investigation starts clean,
+    /// while standalone `.cany` projects (even one named `investigation.cany` without a sibling
+    /// `craft.json`) remain attached.
+    #[test]
+    fn detaching_a_workspace_investigation_clears_state_and_leaves_standalone_projects() {
+        use crate::workspace::{TargetRef, Workspace};
+
+        let dir = crate::testing::temp_dir();
+        let ws = Workspace::create(&dir.join("projects"), "AppA", "Build app A", TargetRef::None).unwrap();
+        let inv = Project::create(&ws.investigation_dir(), "AppA", Purpose::default()).unwrap();
+        let ev_a = evidence("from-build-a");
+        let q_a = Unknown::new("Build A question", "native", Severity::Medium);
+        inv.store_evidence(&ev_a).unwrap();
+        inv.store_unknown(&q_a).unwrap();
+
+        let mut session = Session::isolated(&dir.join("cfg"));
+        session.open_project(inv).unwrap();
+        session.ext.insert(Arc::new(crate::inbox::InboxDir(ws.inbox_dir())));
+        let stale_inv = crate::tools::investigation_tools::Investigation { handoff: Some("Build A handoff".into()), ..Default::default() };
+        crate::tools::investigation_tools::cache(&mut session, stale_inv);
+
+        assert!(session.detach_workspace_investigation(), "build workspace investigation is detached");
+        assert!(session.project.is_none());
+        assert!(session.ext.get::<crate::inbox::InboxDir>().is_none(), "matching workspace InboxDir is cleared too");
+        assert!(ledger_ids(&session).is_empty());
+        assert_eq!(session.unknowns().count(), 0);
+        assert!(crate::tools::investigation_tools::cached(&session).handoff.is_none(), "cached investigation state is cleared");
+
+        // Creating a shared project afterwards must not copy build A's evidence, unknowns or handoff.
+        let shared = session.ensure_shared_project().unwrap();
+        assert_ne!(shared, ws.investigation_dir());
+        assert!(shared.starts_with(dir.join("cfg").join("investigations")));
+        let loaded = crate::tools::investigation_tools::load(&session);
+        assert!(loaded.handoff.is_none(), "new shared investigation starts clean");
+        assert!(ledger_ids(&session).is_empty());
+        assert_eq!(session.unknowns().count(), 0);
+
+        // Standalone `.cany` projects — including one beside `craft.json` with a different name
+        // and one named `investigation.cany` without `craft.json` — stay open.
+        for path in [dir.join("standalone.cany"), ws.root.join("other.cany"), dir.join("not-a-workspace").join("investigation.cany")] {
+            let p = Project::create(&path, "Standalone", Purpose::Education).unwrap();
+            session.open_project(p).unwrap();
+            assert!(!session.detach_workspace_investigation(), "standalone {} stays attached", path.display());
+            assert_eq!(session.project.as_ref().map(|p| &p.root), Some(&path));
+        }
     }
 }
