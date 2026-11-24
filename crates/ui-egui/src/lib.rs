@@ -1016,6 +1016,13 @@ impl CraftApp {
 
     /// Run a tool on a worker; the result goes to `route`.
     pub fn run_tool(&mut self, tool: &str, params: Value, route: Route, consent: Consent) {
+        let detach_workspace = matches!(route, Route::Chat { .. });
+        self.run_tool_with(tool, params, route, consent, detach_workspace);
+    }
+
+    /// As [`CraftApp::run_tool`], letting the caller decide whether to detach any attached build
+    /// workspace's `investigation.cany` before running the tool (#2341).
+    pub(crate) fn run_tool_with(&mut self, tool: &str, params: Value, route: Route, consent: Consent, detach_workspace: bool) {
         let Some(spec) = self.engine.registry().get(tool).copied() else {
             self.log(true, format!("No tool named {tool}"));
             return;
@@ -1039,7 +1046,7 @@ impl CraftApp {
         self.log(false, format!("Running {id}"));
         let chat = matches!(route, Route::Chat { .. });
         let job = self.jobs.spawn(title, true, move |j| {
-            if chat {
+            if detach_workspace {
                 engine.session().detach_workspace_investigation();
             }
             let progress = j.reporter();
@@ -1276,8 +1283,14 @@ impl CraftApp {
     }
 
     pub fn first_look(&mut self, intro: &str, cta: bool) {
+        self.first_look_with(intro, cta, true);
+    }
+
+    /// Run the overview tool for chat, letting the caller decide whether to detach any attached
+    /// build workspace's `investigation.cany` first (#2341).
+    pub(crate) fn first_look_with(&mut self, intro: &str, cta: bool, detach_workspace: bool) {
         if let Some(tool) = self.first_look_tool() {
-            self.run_tool(tool, json!({}), Route::Chat { intro: intro.to_string(), cta }, Consent::NotAsked);
+            self.run_tool_with(tool, json!({}), Route::Chat { intro: intro.to_string(), cta }, Consent::NotAsked, detach_workspace);
         }
     }
 
@@ -1438,7 +1451,11 @@ impl CraftApp {
     }
 
     /// Send a question: to the AI when one is set up, otherwise answered by the built-in engines.
-    pub fn send(&mut self, text: &str) {
+    ///
+    /// `detach_workspace` is `true` for Beginner Ask ("Just look inside") so a fresh conversation
+    /// or no-AI first look detaches any attached build workspace's `investigation.cany`, and
+    /// `false` for the Experienced workbench console so it stays attached to the current project.
+    pub fn send(&mut self, text: &str, detach_workspace: bool) {
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
@@ -1450,7 +1467,12 @@ impl CraftApp {
             self.backend_choices = self.backend_choices.wrapping_add(1);
         }
         if self.state.backend.is_some() && self.conversation.is_none() {
-            match self.hub.start_detached(self.state.backend.as_deref(), self.beginner()) {
+            let started = if detach_workspace {
+                self.hub.start_detached(self.state.backend.as_deref(), self.beginner())
+            } else {
+                self.hub.start(self.state.backend.as_deref(), self.beginner())
+            };
+            match started {
                 Ok(c) => self.conversation = Some(c),
                 // The AI that was picked didn't start (it may be turned off), so the error is the
                 // answer; an AI is set up, so the built-in engines' "no AI brain" line would be wrong.
@@ -1477,7 +1499,7 @@ impl CraftApp {
             });
             return;
         }
-        self.first_look(&tr("There's no AI brain set up yet, so here's what the built-in engines found:"), true);
+        self.first_look_with(&tr("There's no AI brain set up yet, so here's what the built-in engines found:"), true, detach_workspace);
     }
 
     /// Stop the answer being worked on: the AI's, and tools working for the conversation. Builds,
@@ -2489,6 +2511,7 @@ mod backend_snapshot_tests {
         };
 
         let mut app = demo::app(engine.clone());
+        demo::deep(&mut app);
         let journal_of_a = || {
             std::fs::read_dir(inv_a.join("journal"))
                 .into_iter()
@@ -2506,7 +2529,7 @@ mod backend_snapshot_tests {
         let file_b = dir.path().join("other.bin");
         std::fs::write(&file_b, b"unrelated target B").unwrap();
         let chat_before = app.chat_jobs.len();
-        app.open_path(file_b);
+        app.open_path(file_b.clone());
         let open_job = app.jobs.list.last().expect("open_path spawned a job").id;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut opened = None;
@@ -2523,7 +2546,18 @@ mod backend_snapshot_tests {
             }
         }
         let opened = opened.expect("open_path job finished");
+        match &opened.result {
+            Ok(Done::Opened { result: Ok(_), .. }) => {}
+            Ok(Done::Opened { result: Err(e), .. }) => panic!("open_path failed for unrelated target B: {e:?}"),
+            Ok(_) => panic!("open_path job returned unexpected Done variant"),
+            Err(e) => panic!("open_path worker failed: {e}"),
+        }
         assert!(engine.session().project.is_none(), "open_path worker detached build workspace A before first_look");
+        assert_eq!(
+            engine.session().active().expect("opened target B is active").target.path,
+            file_b,
+            "session active target must be file_b rather than the demo target"
+        );
         app.handle_done(opened);
         let follow_up: Vec<u64> = app.chat_jobs[chat_before..].to_vec();
         if !follow_up.is_empty() {
@@ -2546,7 +2580,7 @@ mod backend_snapshot_tests {
         assert!(app.view.active.is_some(), "opened target from step 1 is active");
         attach();
         let chat_before = app.chat_jobs.len();
-        app.send("What is inside this file?");
+        app.send("What is inside this file?", true);
         let first_look_jobs: Vec<u64> = app.chat_jobs[chat_before..].to_vec();
         assert!(!first_look_jobs.is_empty(), "send() without an AI backend spawned a first_look chat job");
         drain_jobs(&mut app, &first_look_jobs);
@@ -2646,5 +2680,67 @@ mod backend_snapshot_tests {
         assert_eq!(app.view.ledger.len(), 1);
         assert_eq!(app.view.ledger[0].id, ev_b.id, "refreshed view shows new evidence instead of detached project A's");
         assert!(app.view.project.is_none());
+    }
+
+    /// #2341 review: sending from the Experienced workbench console (`detach_workspace = false`)
+    /// keeps build project A attached, while sending from Beginner Ask (`detach_workspace = true`)
+    /// detaches A.
+    #[test]
+    fn workbench_send_keeps_build_project_while_ask_send_detaches_it() {
+        use craft_anything_engine::project::{Project, Purpose};
+        use craft_anything_engine::workspace::{TargetRef, Workspace};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(&dir.path().join("projects"), "ProjectA", "Build A", TargetRef::None).unwrap();
+        let inv_a = ws.investigation_dir();
+        let make_app = |mode: Mode| {
+            let mut session = craft_anything_engine::Session::isolated(&dir.path().join(format!("cfg-{mode:?}")));
+            session.settings.mode = mode;
+            session.settings.language = "en".into();
+            let p = Project::open(&inv_a).or_else(|_| Project::create(&inv_a, "ProjectA", Purpose::default())).unwrap();
+            session.open_project(p).unwrap();
+            let engine = Arc::new(Engine::new(session));
+            let mut app = demo::app(engine.clone());
+            // Local closed-port API backend (same fixture as settings_ui::tests): starts a real
+            // ApiConversation and finishes quickly without leaving this machine.
+            let cfg = BackendConfig {
+                name: "LocalBox".into(),
+                kind: craft_anything_ai::BackendKind::OpenaiCompatible,
+                model: "m".into(),
+                base_url: Some("http://127.0.0.1:9/v1".into()),
+                ssh_host: None,
+                enabled: true,
+            };
+            app.hub.add_backend(cfg, None).unwrap();
+            app.state.backend = Some("LocalBox".into());
+            (engine, app)
+        };
+        let wait_turn = |app: &mut CraftApp| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                app.poll_conversation();
+                if !app.answering() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("conversation did not finish turn");
+        };
+
+        // 1. Experienced workbench console path keeps build project A attached.
+        let (wb_engine, mut wb_app) = make_app(Mode::Experienced);
+        wb_app.send("Inspect build project A", false);
+        wait_turn(&mut wb_app);
+        assert_eq!(
+            wb_engine.session().project.as_ref().map(|p| p.root.clone()),
+            Some(inv_a.clone()),
+            "workbench console chat must keep build project A attached"
+        );
+
+        // 2. Beginner Ask ("Just look inside") path detaches build project A.
+        let (ask_engine, mut ask_app) = make_app(Mode::Beginner);
+        ask_app.send("Look inside something else", true);
+        wait_turn(&mut ask_app);
+        assert!(ask_engine.session().project.is_none(), "Beginner Ask chat must detach build project A");
     }
 }

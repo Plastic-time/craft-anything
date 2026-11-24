@@ -1206,7 +1206,7 @@ fn asking_without_ai_runs_the_built_in_engines() {
         a
     });
     h.run_steps(3);
-    h.state_mut().send("What does this program do?");
+    h.state_mut().send("What does this program do?", true);
     // A first-look tool always exists (core_session_show at worst); its answer and the call to
     // action arrive without blocking the UI.
     assert!(wait(&mut h, |a| a.state.chat.iter().any(|i| matches!(i, ChatItem::AddBrain))));
@@ -1240,7 +1240,7 @@ fn asking_an_ai_that_is_turned_off_says_so_instead_of_looking_alone() {
         a
     });
     h.run_steps(3);
-    h.state_mut().send("What does this program do?");
+    h.state_mut().send("What does this program do?", true);
     h.run_steps(6);
     let (said, add) = {
         let chat = &h.state().state.chat;

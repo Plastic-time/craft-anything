@@ -197,7 +197,7 @@ fn target_card(app: &mut CraftApp, ui: &mut Ui) {
         ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
             for q in suggestions(kind) {
                 if widgets::suggestion(ui, q).clicked() {
-                    app.send(&tr(q));
+                    app.send(&tr(q), true);
                 }
             }
         });
@@ -363,7 +363,7 @@ fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, dense: bool) {
         // One answer at a time; what's typed meanwhile stays in the box.
         if out.send && !answering {
             let text = std::mem::take(&mut app.state.input);
-            app.send(&text);
+            app.send(&text, !dense);
         }
     });
 }

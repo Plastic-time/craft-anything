@@ -1728,7 +1728,7 @@ mod tests {
         app.hub.add_backend(config, None).unwrap();
         app.state.backend = Some("Box".into());
         let started = app.backend_choices;
-        app.send("Hi");
+        app.send("Hi", false);
         assert!(app.conversation.is_some(), "the chat started");
         app.handle_done(Finished {
             job: 0,
@@ -1738,7 +1738,7 @@ mod tests {
         assert!(app.conversation.is_some(), "the chat keeps going");
         // A follow-up in a chat that started before the add counts the same way.
         let started = app.backend_choices;
-        app.send("And then?");
+        app.send("And then?", false);
         app.handle_done(Finished {
             job: 0,
             result: Ok(Done::BackendAdded { name: "Laptop".into(), result: Ok(()), choices: started, address: String::new() }),
