@@ -1039,7 +1039,7 @@ impl CraftApp {
         self.log(false, format!("Running {id}"));
         let chat = matches!(route, Route::Chat { .. });
         let job = self.jobs.spawn(title, true, move |j| {
-            if chat && id == "web_site_open" {
+            if chat {
                 engine.session().detach_workspace_investigation();
             }
             let progress = j.reporter();
@@ -2489,14 +2489,29 @@ mod backend_snapshot_tests {
         };
 
         let mut app = demo::app(engine.clone());
+        let journal_of_a = || {
+            std::fs::read_dir(inv_a.join("journal"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
-        // 1. `open_path` detaches build workspace A.
+        // 1. `open_path` detaches build workspace A, and any follow-up `first_look` chat job
+        //    started in Beginner mode finishes before later steps re-attach A.
         attach();
         let file_b = dir.path().join("other.bin");
         std::fs::write(&file_b, b"unrelated target B").unwrap();
+        let chat_before = app.chat_jobs.len();
         app.open_path(file_b);
         let open_job = app.jobs.list.last().expect("open_path spawned a job").id;
         drain_jobs(&mut app, &[open_job]);
+        let follow_up: Vec<u64> = app.chat_jobs[chat_before..].to_vec();
+        if !follow_up.is_empty() {
+            drain_jobs(&mut app, &follow_up);
+        }
         assert!(engine.session().project.is_none(), "open_path detached build workspace A");
 
         // 2. `run_tool("web_site_open", ..., Route::Chat)` detaches build workspace A.
@@ -2506,27 +2521,68 @@ mod backend_snapshot_tests {
         drain_jobs(&mut app, &[web_job]);
         assert!(engine.session().project.is_none(), "web_site_open chat entry detached build workspace A");
 
-        // 3. "A game's files" (`game_files::folder_picked`) detaches build workspace A before
-        //    running `game_archives_list` and `core_target_triage`, so neither records evidence or
-        //    journal entries into project A.
+        // 3. With no AI backend configured, `send()` falls back to `first_look` (`Route::Chat` ->
+        //    `core_target_triage`), which must detach build workspace A before running so A's
+        //    journal does not record `core_target_triage`.
+        app.state.backend = None;
+        app.conversation = None;
+        app.refresh_view();
+        assert!(app.view.active.is_some(), "opened target from step 1 is active");
+        attach();
+        let chat_before = app.chat_jobs.len();
+        app.send("What is inside this file?");
+        let first_look_jobs: Vec<u64> = app.chat_jobs[chat_before..].to_vec();
+        assert!(!first_look_jobs.is_empty(), "send() without an AI backend spawned a first_look chat job");
+        drain_jobs(&mut app, &first_look_jobs);
+        assert!(engine.session().project.is_none(), "no-AI first_look chat detached build workspace A");
+        let journal = journal_of_a();
+        assert!(!journal.contains("core_target_triage"), "no-AI first_look must not leak core_target_triage into A's journal: {journal}");
+
+        // 4. "A game's files": each GameFiles action re-attaches A first, drains its own job(s),
+        //    and asserts A was detached and its tool was not journaled into A.
         attach();
         let game_dir = dir.path().join("unrelated-game");
         std::fs::create_dir_all(&game_dir).unwrap();
-        game_files::folder_picked(&mut app, game_dir);
+        game_files::folder_picked(&mut app, game_dir.clone());
         let game_jobs: Vec<u64> = app.state.game.jobs.keys().copied().collect();
         assert_eq!(game_jobs.len(), 2, "folder_picked spawned archive scan and triage jobs");
         drain_jobs(&mut app, &game_jobs);
         assert!(engine.session().project.is_none(), "game_files::folder_picked detached build workspace A");
-        let journal = std::fs::read_dir(inv_a.join("journal"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let journal = journal_of_a();
         assert!(
             !journal.contains("game_archives_list") && !journal.contains("core_target_triage"),
-            "GameFiles tools must not leak into build project A's journal: {journal}"
+            "folder_picked tools must not leak into build project A's journal: {journal}"
         );
+
+        let fake_archive = game_dir.join("missing.pak").display().to_string();
+        for (kind, tool) in
+            [("unreal_pak", "game_pak_list"), ("unity_assets", "game_unity_list"), ("unreal_iostore", "game_iostore_list"), ("other", "game_unity_bundle_list")]
+        {
+            attach();
+            let before_jobs = app.jobs.list.len();
+            game_files::open_archive(&mut app, fake_archive.clone(), kind.into());
+            let new_jobs: Vec<u64> = app.jobs.list[before_jobs..].iter().map(|j| j.id).collect();
+            assert_eq!(new_jobs.len(), 1, "open_archive({kind}) spawned a listing job");
+            drain_jobs(&mut app, &new_jobs);
+            assert!(engine.session().project.is_none(), "open_archive({kind}) detached build workspace A");
+            let journal = journal_of_a();
+            assert!(!journal.contains(tool), "open_archive({kind}) must not leak {tool} into A's journal: {journal}");
+        }
+
+        for (kind, item, tool) in [
+            ("unreal_pak", json!({"path": "Hero/Tex.uasset"}), "game_unreal_texture_export"),
+            ("unity_bundle", json!({"file": "CAB-1", "path_id": 1}), "game_unity_asset_export"),
+        ] {
+            attach();
+            app.state.game.pending = Some(state::PendingPicture { archive: fake_archive.clone(), kind: kind.into(), item, name: "pic.png".into() });
+            let before_jobs = app.jobs.list.len();
+            game_files::save_to(&mut app, dir.path().join(format!("out-{kind}.png")));
+            let new_jobs: Vec<u64> = app.jobs.list[before_jobs..].iter().map(|j| j.id).collect();
+            assert_eq!(new_jobs.len(), 1, "save_to({kind}) spawned an export job");
+            drain_jobs(&mut app, &new_jobs);
+            assert!(engine.session().project.is_none(), "save_to({kind}) detached build workspace A");
+            let journal = journal_of_a();
+            assert!(!journal.contains(tool), "save_to({kind}) must not leak {tool} into A's journal: {journal}");
+        }
     }
 }

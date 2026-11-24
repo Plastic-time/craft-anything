@@ -5107,13 +5107,21 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
         let host = Arc::new(EngineHost(engine.clone()));
         let mut conv = ApiConversation::start(host, vec![slot], LoopConfig { detach_workspace_investigation: detach, ..LoopConfig::default() }).unwrap();
         conv.send(msg);
+        let mut events = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if conv.poll().iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
-                break;
+            for event in conv.poll() {
+                let err = matches!(event, AgentEvent::Error { .. });
+                let done = matches!(event, AgentEvent::TurnDone { .. });
+                events.push(event);
+                assert!(!err, "agent turn returned an unexpected error: {events:?}");
+                if done {
+                    return;
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        panic!("agent turn timed out without TurnDone: {events:?}");
     };
 
     // 1. A `for_a_run` build attaches A to both its own run engine and the app's shared session.

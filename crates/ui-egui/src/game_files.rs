@@ -178,7 +178,7 @@ fn archives(app: &mut CraftApp, ui: &mut Ui, w: f32) {
     }
 }
 
-fn open_archive(app: &mut CraftApp, path: String, kind: String) {
+pub(crate) fn open_archive(app: &mut CraftApp, path: String, kind: String) {
     let g = &mut app.state.game;
     g.supersede(GameJob::Listing);
     g.open = Some(path.clone());
