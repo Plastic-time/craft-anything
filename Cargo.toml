@@ -130,3 +130,6 @@ panic = "abort"
 # Remove this once the upstream wgpu release picks a Metal version the compiler accepts. See vendor/wgpu-hal/CRAFT_ANYTHING.md.
 [patch.crates-io]
 wgpu-hal = { path = "vendor/wgpu-hal" }
+# winit with upstream's Windows 11 DPI-change fix (Craft Anything #1814; upstream winit #4041, #4341).
+# Remove once eframe uses a winit with it. See vendor/winit/CRAFT_ANYTHING.md.
+winit = { path = "vendor/winit" }

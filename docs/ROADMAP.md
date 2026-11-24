@@ -365,6 +365,12 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
       — claimed: tanish2k09, branch bugfix/r5.2-interrupted-loopback-call
 - [ ] `mcp_client.rs`'s `post` reports an interrupted call (EINTR) as "Couldn't reach the plugin"
       (`EngineMissing`); a JSON-RPC POST isn't safe to send again, so say it was interrupted instead
+- [x] Every PR that adds UI strings appends them to the end of all 14 catalogs, so any two such
+      PRs conflict once one merges (#1465): one folder per language (`i18n/<code>/core.tsv`),
+      each PR adding its own file there, joined in name order by `build.rs`
+      — claimed: justinjohn0306, branch chore/r5.2-catalog-folders
+- [ ] `i18n/awaiting.txt` is still one shared list that PRs append to, so two UI changes that
+      each list strings awaiting translation still conflict there (#1465)
 
 ### R5.3 A builder that can't make progress stops
 Owner: open · Status: todo
@@ -736,12 +742,16 @@ Owner: open · Status: todo
 - [x] A saved fal.ai key reaches an API-key build's asset tools; every call said "No fal.ai key"
       (#923). Outside a project the tools now say that instead. Not checked with a real fal.ai key
       or API build
-- [x] An API-key build works alone: it shares the app's session, whose `attach` points at whichever
-      project started last, so another build beside it sent its files and asset spending to the
-      wrong project (`build.parallel` is 2 by default). Others wait their turn in the queue
-- [ ] Let API-key builds run side by side: give each an engine of its own, as a question has. This
-      also closes the gap left in working alone: the app and the `rebuild_start` tool each keep a
-      queue, so a build the in-app chat starts isn't kept apart from one the app started
+- [x] Each build has an engine of its own: sharing the app's session, whose `attach` points
+      at whichever project started last, sent a build's files and asset spending to the wrong project
+      (`build.parallel` is 2 by default). It takes on settings and project permissions from the
+      app before each tool call, and the asset keys are one copy all the engines share, so a key
+      saved or removed through any of them reaches the rest. Started while the app's session is
+      busy, it begins from the saved settings. It keeps the mode it started in, and agent-app builds
+      get one too, so no build's tools work in the app's session. Unit-tested; two real API-key
+      builds at once not run
+- [ ] A setting a builder changes with `settings_set` (Deep mode only) stays in its own engine and
+      file: the app's copy doesn't hear of it, and the app's next save can overwrite it
 - [ ] Check #369 live with Kimi K3 and a key limited to Kimi/Moonshot models (needs the person's
       OpenRouter key): that the build starts, or that the error now names the provider's reason
 - [ ] A live API-key build (needs a key on the test machine)
@@ -1071,6 +1081,11 @@ Owner: open · Status: in progress
       — claimed: tanish2k09, branch bugfix/r1.5-https-plugin-redirects
 - [ ] Live-check an https MCP plugin against a real server that redirects (to another path and
       to another host), and that the system proxy still carries https plugin requests
+- [x] Stop Ghidra's analysis from the project and keep the project (#948): pausing lets it go
+      on, so only closing the app or deleting the project stopped it. Stopped, it stays off for
+      the project's builds, the builder's tool server included, until a new request: "Stop the
+      analysis" on the project, `engines_analysis_stop`, a `ghidra-stopped` file in its folder
+      — claimed: justinjohn0306, branch `feature/r1.5-stop-ghidra-for-project`
 - [ ] More pins once their hashes are checked against the publisher: Chromium (no published
       checksums found yet), Rizin for Linux (the tar.xz unpacks to ~800 MB, so it needs streaming
       extraction) and macOS (a .pkg)
@@ -1858,6 +1873,11 @@ Gaps found while using the app for real projects.
       resize edges under a see-through title bar, which is 32 pt there so the buttons sit centred
       in it (#20)
 - [ ] macOS: the app's icon is bigger than the system's (#20)
+- [x] Windows 11: the window can't be dragged onto a screen with different scaling; it stops
+      half-way and snaps back (#1814). winit 0.30's DPI-change handler moved it back onto the
+      screen it came from (upstream rust-windowing/winit#4041, fixed only for 0.31 in #4341):
+      `vendor/winit` backports #4341. Not run on two screens with different scaling here
+      — claimed: justinjohn0306, branch bugfix/r2.9-window-across-scaled-screens
 - [ ] Show a command's output while it runs: Claude Code reports a tool's result only when it
       ends, so a long `cargo build` is one quiet line until then. Watching the agent's child
       processes from outside could say what's running and for how long
@@ -1949,9 +1969,11 @@ Gaps found while using the app for real projects.
       — claimed: bflatastic, branch bugfix/claude-session-too-long
 - [ ] Capture the line Claude Code really prints when its conversation is too long, and decide on
       a typed field of it if there is one, not on its words (review of #2043)
-- [ ] A note the builder's hook took during a turn that ends with a lost or too-long conversation
+- [x] A note the builder's hook took during a turn that ends with a lost or too-long conversation
       isn't in the new conversation's first message, though the feed shows it as delivered
-      (review of #2043). Hand such a note on with the fresh start, for a missing session as well
+      (review of #2043). Such a note now follows the fresh start (`taken_prompt`), and with no
+      fresh start it waits for the next run
+      — claimed: justinjohn0306, branch bugfix/r2.9-note-across-fresh-start
 - [x] `build_file_edit` read the whole project file into memory before replacing text; it now
       uses the same 16 MiB cap as a read, refusing a larger file before it is loaded and leaving
       it unchanged. A file at the cap still edits when the result fits the 8 MB write cap. Engine
@@ -2169,11 +2191,21 @@ Gaps found while using the app for real projects.
       over SSH (a tunnelled model) builds on this computer (review of #1846): skip it only
       when the builder's tools run on the other computer (`tools_run_remotely`)
       — claimed: justinjohn0306, branch bugfix/r2.9-cargo-check-api-over-ssh
-- [ ] A project moved to another stack mid-build keeps its recorded stack (only package.json
+- [x] A project moved to another stack mid-build keeps its recorded stack (only package.json
       updates it), and the build check runs `cargo build` whenever app/Cargo.toml is there, so
       a Rust project rewritten in Python is still checked with Cargo until the old manifest is
       moved out (#1837): record the stack from what was built for every toolchain, and check
-      with that
+      with that. Done as: a follow-up naming a stack in another language records it once that
+      language's files are in app/, and the checks use the recorded stack's toolchain
+      — claimed: justinjohn0306, branch bugfix/r2.9-check-the-stack-that-was-built
+- [ ] A move is recorded only when the turn that made it finishes: a turn cut off (a stop, a
+      crash) and then retried with no message keeps the old stack, so the check can still use
+      the old language's manifest (review of #2099). Keep the requested stack until a turn
+      ends, or read it from the files the build left
+- [x] A move to a language with no stack in stacks.toml (Go, .NET, Java) is still checked with
+      the old manifest's toolchain while it's there: only a follow-up naming a stack moves the
+      record. Go, C# (.NET) and Java (Maven or Gradle) now have stacks; the other toolchains
+      (Make) have no language to ask for
 - [x] One design system for the desktop app: a typed scale (text sizes, gaps, padding, icon and
       control sizes) in `theme.rs`, one set of buttons (primary, secondary, ghost, danger),
       switches and fields in `widgets.rs`, and every screen moved onto them, so sizes and spacing
@@ -2213,6 +2245,10 @@ Gaps found while using the app for real projects.
       A maintainer's call, made by merging: Simple's larger text was there for people who find
       small text hard to read, and this leaves that to zoom
       — claimed: jgt87, branch feature/r2.9-one-size-both-modes — PR #1236
+- [x] On Windows the build check said "npm.cmd isn't installed or isn't on your PATH" although a
+      terminal found npm (#2178): programs are looked up in a PATH whose `%VAR%` entries are
+      expanded (`which::expand_vars`), and in Node.js's own install folder after it
+      — claimed: justinjohn0306, branch bugfix/2178-npm-on-windows-path
 
 ### R2.10 Pinned builds
 Owner: maintainers · Status: in progress

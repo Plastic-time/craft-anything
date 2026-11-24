@@ -93,11 +93,6 @@ fn sign_in_args(opts: &LaunchOptions) -> Vec<String> {
         return Vec::new();
     }
     let mut args = Vec::new();
-    // A saved sign-in is made in a window and read later without one: on Linux both launches
-    // must keep cookies with the same key, so neither asks the desktop's keyring.
-    if cfg!(target_os = "linux") {
-        args.push("--password-store=basic".into());
-    }
     // Only this profile has password saving turned off (`prepare_sign_in_profile`): never let a
     // copied `Local State` pick another one.
     args.push(format!("--profile-directory={}", super::site_sign_in::SIGN_IN_PROFILE));
@@ -280,6 +275,12 @@ impl Browser {
         }
         if opts.no_sandbox {
             args.push("--no-sandbox".into());
+        }
+        // On Linux the desktop's keyring is never asked: outside a desktop session it waits on a
+        // password prompt nobody sees (#2264), and a saved sign-in, made in a window and read
+        // later without one, needs both launches to keep cookies with the same key.
+        if cfg!(target_os = "linux") {
+            args.push("--password-store=basic".into());
         }
         args.extend(sign_in_args(opts));
         args.push(opts.start_url.clone().unwrap_or_else(|| "about:blank".into()));
@@ -1284,7 +1285,6 @@ mod tests {
             let args = sign_in_args(opts);
             assert!(args.contains(&pinned), "{args:?}");
             assert!(args.iter().any(|a| a == "--restore-last-session"), "{args:?}");
-            assert_eq!(args.iter().any(|a| a == "--password-store=basic"), cfg!(target_os = "linux"), "{args:?}");
         }
         assert!(sign_in_args(&LaunchOptions::default()).is_empty());
     }

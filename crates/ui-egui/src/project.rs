@@ -1833,6 +1833,20 @@ fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, t: &Tokens, last_waitin
         });
         ui.add_space(theme::space::XS);
     }
+    // Ghidra's analysis goes on after Pause, so nothing is lost: this is the way to stop it (#948).
+    if let Some(root) = app.workspace.as_ref().map(|w| w.root.clone()).filter(|r| craft_anything_engine::tools::deep::analysing_for(r)) {
+        ui.horizontal_wrapped(|ui| {
+            icons::show(ui, "activity", theme::icon::MD, t.accent_ink);
+            ui.label(RichText::new(tr("Ghidra is analysing the original. Pausing doesn't stop it, so nothing is lost.")).color(t.text_dim).size(theme::SMALL));
+            if widgets::link(ui, "Stop the analysis")
+                .on_hover_text(tr("Ghidra stays off for this project until your next request, which starts it again from the beginning. Until then, decompiling uses the built-in engine."))
+                .clicked()
+            {
+                app.act("engines_analysis_stop", serde_json::json!({"project": root}), tr("Stop the analysis"));
+            }
+        });
+        ui.add_space(theme::space::XS);
+    }
     // Pause was pressed and the build hasn't stopped yet: the button says so until it does.
     let open_root = app.workspace.as_ref().map(|w| w.root.clone());
     if !running && let Some(root) = &open_root {

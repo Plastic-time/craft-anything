@@ -177,10 +177,13 @@ pub fn play_log(ws: &Workspace) -> PathBuf {
 }
 
 /// Read a `pin.json` of any version this build understands; a newer one is read as far as its
-/// fields are known.
+/// fields are known. Only a missing version means version 1.
 pub fn read_pin(bytes: &[u8]) -> Result<Pin, ToolError> {
     let mut doc: Value = serde_json::from_slice(bytes).map_err(|e| ToolError::invalid(format!("it isn't valid JSON: {e}")))?;
-    let found = doc.get("version").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(1);
+    let found = match doc.get("version") {
+        None => 1,
+        Some(v) => v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| ToolError::invalid(format!("its version ({v}) isn't a whole number")))?,
+    };
     if found <= PIN_VERSION {
         let reached = versioned::upgrade(&mut doc, found, 1, PIN_STEPS).map_err(|e| ToolError::invalid(format!("it couldn't be brought up to date: {e}")))?;
         if let Some(obj) = doc.as_object_mut() {
@@ -535,6 +538,11 @@ pub fn rename(ws: &Workspace, id: u32, name: &str) -> Result<Pin, ToolError> {
         return Err(ToolError::invalid("A pin needs a name."));
     }
     let mut pin = get(ws, id)?;
+    // Saving would drop the fields this build doesn't know (docs/file-formats.md).
+    if pin.version > PIN_VERSION {
+        return Err(ToolError::unsupported("This pin was saved by a newer Craft Anything, so it isn't changed.")
+            .with_remediation("Update Craft Anything to rename it."));
+    }
     pin.name = name.to_string();
     save(ws, &pin)?;
     Ok(pin)
@@ -1031,6 +1039,14 @@ mod tests {
         let pin = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
         assert_eq!(rename(&ws, pin.id, "Best one").unwrap().name, "Best one");
         assert!(rename(&ws, pin.id, " ").is_err());
+        let file = pin.dir(&ws).join(PIN_FILE);
+        let mut newer: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        newer["version"] = Value::from(PIN_VERSION + 1);
+        newer["colour"] = Value::from("red");
+        let newer = serde_json::to_vec(&newer).unwrap();
+        std::fs::write(&file, &newer).unwrap();
+        assert_eq!(rename(&ws, pin.id, "Other").unwrap_err().code, ErrorCode::NotSupported);
+        assert_eq!(std::fs::read(&file).unwrap(), newer, "a newer pin is left as it was");
         std::fs::create_dir_all(ws.root.join(PINNED).join("7")).unwrap();
         std::fs::write(ws.root.join(PINNED).join("7").join(PIN_FILE), "{").unwrap();
         assert_eq!(list(&ws).len(), 1);
@@ -1050,6 +1066,10 @@ mod tests {
         let newer = read_pin(br#"{"version":9,"id":2,"name":"A","mode":"frozen","created_ms":5,"colour":"red"}"#).unwrap();
         assert_eq!(newer.version, 9, "a newer pin keeps its version");
         assert!(read_pin(b"[]").is_err());
+        for bad in ["4294967296", "-1", "\"2\"", "null", "1.5"] {
+            let text = format!(r#"{{"version":{bad},"id":2,"name":"A","mode":"frozen","created_ms":5}}"#);
+            assert!(read_pin(text.as_bytes()).is_err(), "version {bad} isn't read as version 1");
+        }
     }
 
     #[test]

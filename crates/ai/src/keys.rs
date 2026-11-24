@@ -42,13 +42,14 @@ pub fn asset_keys(store: &KeyStore, providers: &AssetProviders) -> AssetKeys {
     )
 }
 
-/// After a key changed: keys a run already loaded into `session` follow, so a removed one stops being
-/// spent at once. A session with none loaded stays that way. Reads the keychain, so call it off the UI
-/// thread; a tool passes the session it holds, because locking it again would wait forever.
-pub fn refresh_loaded(session: &mut craft_anything_engine::Session, store: &KeyStore) {
-    if session.ext.get::<AssetKeys>().is_some() {
+/// After a key changed: keys a run already loaded follow, in `session` (`engine`'s) at once and in
+/// every engine beside it at its next tool call, so a removed one stops being spent. With none
+/// loaded, none appear. Reads the keychain, so call it off the UI thread; a tool passes the session
+/// it holds, because locking it again would wait forever.
+pub fn refresh_loaded(session: &mut craft_anything_engine::Session, engine: &craft_anything_engine::Engine, store: &KeyStore) {
+    if session.ext.get::<AssetKeys>().is_some() || engine.asset_keys_loaded() {
         let providers = session.ext.get::<AssetProviders>().map(|p| p.as_ref().clone()).unwrap_or_default();
-        session.ext.insert(std::sync::Arc::new(asset_keys(store, &providers)));
+        engine.load_asset_keys(session, || asset_keys(store, &providers));
     }
 }
 
@@ -413,16 +414,17 @@ mod tests {
         let mut providers = AssetProviders::built_in();
         providers.register(std::sync::Arc::new(Other));
         s.set(&asset_key_name("other"), "o-1").unwrap();
-        let mut session = craft_anything_engine::testing::session();
+        let engine = craft_anything_engine::Engine::new(craft_anything_engine::testing::session());
+        let mut session = engine.session();
         session.ext.insert(std::sync::Arc::new(providers));
-        refresh_loaded(&mut session, &s);
+        refresh_loaded(&mut session, &engine, &s);
         assert!(session.ext.get::<AssetKeys>().is_none(), "no run loaded any");
 
         session.ext.insert(std::sync::Arc::new(AssetKeys([("other".to_string(), "old".to_string())].into())));
-        refresh_loaded(&mut session, &s);
+        refresh_loaded(&mut session, &engine, &s);
         assert_eq!(session.ext.get::<AssetKeys>().unwrap().get("other"), Some("o-1"), "a changed key");
         s.delete(&asset_key_name("other")).unwrap();
-        refresh_loaded(&mut session, &s);
+        refresh_loaded(&mut session, &engine, &s);
         assert_eq!(session.ext.get::<AssetKeys>().unwrap().get("other"), None, "a removed key");
     }
 

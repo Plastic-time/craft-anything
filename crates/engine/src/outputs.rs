@@ -460,10 +460,12 @@ pub fn npm_script(app: &Path, script: &str) -> Option<String> {
     pkg.get("scripts")?.get(script)?.as_str().map(str::to_string)
 }
 
-/// The crates `app`'s Cargo.toml depends on; none without a readable one.
+/// The crates `app`'s Cargo.toml depends on, by package name (`engine = { package = "bevy" }` is
+/// bevy); none without a readable one.
 pub fn cargo_dependencies(app: &Path) -> Vec<String> {
     let manifest: Option<toml::Table> = std::fs::read_to_string(app.join("Cargo.toml")).ok().and_then(|t| t.parse().ok());
-    manifest.as_ref().and_then(|m| m.get("dependencies")?.as_table()).map(|d| d.keys().cloned().collect()).unwrap_or_default()
+    let Some(deps) = manifest.as_ref().and_then(|m| m.get("dependencies")?.as_table()) else { return Vec::new() };
+    deps.iter().map(|(key, spec)| spec.get("package").and_then(toml::Value::as_str).unwrap_or(key).to_string()).collect()
 }
 
 fn uses_electron(app: &Path) -> bool {

@@ -462,11 +462,11 @@ fn engine_stacks_get_their_own_steps_checks_and_play() {
 
     let d = tempfile::tempdir().unwrap();
     let stop = CheckStop::default();
-    assert_eq!(build_check(d.path(), "app/", "Unity", Some(ed), &stop), (false, "No Unity project found in app/ yet.".into()));
-    assert_eq!(build_check(d.path(), "app/", "Godot", Some(ed), &stop), (false, "No Godot project (project.godot) found in app/ yet.".into()));
-    assert!(build_check(d.path(), "app/", "Unreal Engine", Some(ed), &stop).1.contains(".uproject"));
+    assert_eq!(build_check(d.path(), "app/", "Unity", None, Some(ed), &stop), (false, "No Unity project found in app/ yet.".into()));
+    assert_eq!(build_check(d.path(), "app/", "Godot", None, Some(ed), &stop), (false, "No Godot project (project.godot) found in app/ yet.".into()));
+    assert!(build_check(d.path(), "app/", "Unreal Engine", None, Some(ed), &stop).1.contains(".uproject"));
     // #174: an app edited in place is said to be in the project folder, not in an app/ that isn't there.
-    let none = build_check(d.path(), "the project folder", "Builder's choice", None, &stop);
+    let none = build_check(d.path(), "the project folder", "Builder's choice", None, None, &stop);
     assert_eq!(none, (false, "No project to build found in the project folder yet.".into()));
 
     // Play: a Godot project opens in Godot; a packaged Unity build runs its own program.
@@ -549,16 +549,33 @@ fn notes_added_while_it_works_reach_the_agent_at_its_next_step() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     assert!(w.added(&mut ws, true, true).is_none(), "nothing added, nothing to say");
     use craft_anything_engine::questions::{self, AskedQuestion};
     let asked = AskedQuestion { deep: false, ..AskedQuestion::new("where is the score kept".into(), "In src.".into(), true, "Stand-in".into(), None, 0) };
     questions::add(&ws, asked.clone()).unwrap();
-    let note = |id, text: &str| Note { id, text: format!("{text} (pictures: a.png)"), shown: text.into(), pictures: Vec::new(), questions: Vec::new() };
+    let note = |id, text: &str| Note {
+        id,
+        text: format!("{text} (pictures: a.png)"),
+        shown: text.into(),
+        pictures: Vec::new(),
+        questions: Vec::new(),
+        added: std::time::SystemTime::now(),
+    };
+    // A note left waiting when the person pressed Stop was asked before it: Ghidra stays off.
+    notes.lock().unwrap().push(note(9, "Older"));
+    std::thread::sleep(Duration::from_millis(5));
+    craft_anything_engine::tools::deep::stop_for(&ws.root).unwrap();
+    w.added(&mut ws, true, true).unwrap();
+    assert!(craft_anything_engine::tools::deep::stopped(&ws.root), "a note from before the stop doesn't undo it");
+    let _ = rx.try_iter().count();
+    std::thread::sleep(Duration::from_millis(5));
     let mut first = note(1, "Make it faster");
     first.questions = vec![asked];
     notes.lock().unwrap().extend([first, note(2, "A blue sky")]);
     let (p, more) = w.added(&mut ws, true, true).unwrap();
+    assert!(!craft_anything_engine::tools::deep::stopped(&ws.root), "a note is a new request, so Ghidra may run again");
     assert!(p.contains("where is the score kept") && p.contains("- Make it faster (pictures: a.png)\n- A blue sky"), "{p}");
     assert_eq!(more.len(), 1, "the question is marked told after the turn");
     assert!(notes.lock().unwrap().is_empty(), "each note goes in once");
@@ -637,6 +654,93 @@ fn a_note_written_for_the_hook_carries_its_answers() {
     // whether the answers are included, so they stay untold here.
     assert_eq!(run.take_notes().len(), 1);
     assert_eq!(questions::untold(&ws, false).len(), 1, "the next run decides whether to tell it");
+}
+
+/// A run as `RebuildRun::start` makes it, without a builder.
+fn bare_run(ws: &Workspace) -> RebuildRun {
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let feed = Arc::new(Mutex::new(feed::FeedLog::open(ws)));
+    let activity = feed.lock().unwrap_or_else(PoisonError::into_inner).activity();
+    RebuildRun {
+        rx,
+        stop: CancelToken::default(),
+        inbox: Inbox::new(ws.inbox_dir()),
+        running: Arc::new(AtomicBool::new(true)),
+        preview: Arc::default(),
+        notes: Arc::default(),
+        clean_room: false,
+        feed,
+        root: ws.root.clone(),
+        started: Instant::now(),
+        activity,
+    }
+}
+
+/// The worker of `run`, reading the notes the run is given.
+fn notes_worker(ws: &Workspace, run: &RebuildRun) -> Worker {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    Worker {
+        wake: Default::default(),
+        engine: Arc::new(Engine::new(craft_anything_engine::testing::session())),
+        tx,
+        stop: CancelToken::default(),
+        preview: Arc::default(),
+        seen: HashSet::new(),
+        inbox: Inbox::new(ws.inbox_dir()),
+        editor: None,
+        notes: run.notes.clone(),
+        feed: run.feed.clone(),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
+        kept_checks: Mutex::default(),
+        assets: false,
+        usage: None,
+        self_check: None,
+        reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
+    }
+}
+
+/// #948 (review on #1903): a note left waiting when the app closed, then a stop, then a run
+/// started without a new request. The run takes the note back as `start` does and the builder
+/// reads it: the note was asked before the stop, so Ghidra stays off. A note left after the stop,
+/// or one from a version that kept no time, is a new request and lets Ghidra run again.
+#[test]
+fn a_note_left_before_a_stop_keeps_it_across_a_restart() {
+    use craft_anything_engine::tools::deep;
+    // Run, then restart without a new request: what the builder sees once it reads the left notes.
+    fn restart(ws: &mut Workspace) -> bool {
+        let left = notes::take_left(&notes::notes_dir(&ws.inbox_dir()), true);
+        assert_eq!(left.len(), 1, "the note was left for the next run");
+        let run = bare_run(ws);
+        run.restore_left(left);
+        notes_worker(ws, &run).added(ws, true, true).expect("the left note is read");
+        assert!(run.waiting().is_empty(), "the builder took it");
+        deep::stopped(&ws.root)
+    }
+
+    // Left before the stop: the stop holds.
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "x", "Copy this game", TargetRef::None).unwrap();
+    bare_run(&ws).add_note("make it blue".into(), "make it blue".into(), Vec::new());
+    std::thread::sleep(Duration::from_millis(5));
+    deep::stop_for(&ws.root).unwrap();
+    assert!(restart(&mut ws), "a note from before the stop doesn't undo it after a restart");
+
+    // Left after the stop: a new request.
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "x", "Copy this game", TargetRef::None).unwrap();
+    deep::stop_for(&ws.root).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    bare_run(&ws).add_note("make it blue".into(), "make it blue".into(), Vec::new());
+    assert!(!restart(&mut ws), "a note added after the stop lets Ghidra run again");
+
+    // An older version's note keeps no time: it's taken as new, as before this change.
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "x", "Copy this game", TargetRef::None).unwrap();
+    deep::stop_for(&ws.root).unwrap();
+    let old = notes::Left { text: "make it blue".into(), shown: "make it blue".into(), pictures: Vec::new(), added: None };
+    notes::hand_over(&notes::notes_dir(&ws.inbox_dir()), 1, "make it blue", Some(&old)).unwrap();
+    assert!(!restart(&mut ws), "a note with no time is a new request");
 }
 
 #[test]
@@ -1304,7 +1408,7 @@ fn needs_an_agent_app() {
     let hub = AiHub::with_stores(engine, d.path().join("settings.toml"), crate::KeyStore::file_only(d.path().join("keys.toml")));
     let ws = Workspace::create(d.path(), "x", "y", TargetRef::None).unwrap();
     let dir = notes::notes_dir(&ws.inbox_dir());
-    let left = notes::Left { text: "make it blue".into(), shown: "make it blue".into(), pictures: Vec::new() };
+    let left = notes::Left { text: "make it blue".into(), shown: "make it blue".into(), pictures: Vec::new(), added: None };
     notes::hand_over(&dir, 1, "make it blue", Some(&left)).unwrap();
     let err = RebuildRun::start(&hub, ws, RunOptions::default()).err().unwrap();
     assert!(err.message.contains("coding agent"), "{}", err.message);
@@ -1498,6 +1602,7 @@ fn an_api_backend_builds_with_the_build_tools() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     w.attach(&ws).unwrap();
     // The model writes a file with the Build tools, then answers.
@@ -1628,6 +1733,7 @@ fn the_mechanics_sheet_is_required_without_claiming_effective_behavior() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     let check = |round| w.run_checks(&ws, &SheetKind, round).unwrap().remove(0);
 
@@ -1881,6 +1987,9 @@ mod picking_up_a_build {
         b.hub.set_asset_key("fal", "k-1").unwrap();
         let ws = Workspace::create(&b.projects, "x", "Build a notes app", TargetRef::None).unwrap();
         let _ = try_it(&b, &ws);
+        // The run loads them in its own engine; the app's takes them on at its next call.
+        assert!(b.hub.engine.asset_keys_loaded());
+        let _ = b.hub.engine.call("core_session_show", serde_json::Value::Null, CallOptions::new(Caller::Cli));
         let keys = b.hub.engine.session().ext.get::<craft_anything_engine::tools::asset_tools::AssetKeys>().unwrap_or_default();
         assert_eq!(keys.get("fal"), Some("k-1"));
     }
@@ -2336,7 +2445,7 @@ mod picking_up_a_build {
         use crate::model::{Block, ChatModel, Delta, Stop, StopReason, TurnRequest, TurnResult};
         type Notes = Arc<Mutex<Vec<Note>>>;
         fn note(text: &str) -> Note {
-            Note { id: 42, text: text.into(), shown: text.into(), pictures: Vec::new(), questions: Vec::new() }
+            Note { id: 42, text: text.into(), shown: text.into(), pictures: Vec::new(), questions: Vec::new(), added: std::time::SystemTime::now() }
         }
         struct NoteModel {
             script: Scripted,
@@ -2904,6 +3013,53 @@ fn a_caught_bug_leaves_a_status_the_person_can_act_on() {
     assert!(ok && !paused && message == "Ready.");
 }
 
+/// A key removed through one run's engine (`assets_key_remove` refreshes the session it holds)
+/// came back at the next call from the app's older copy, and a run beside it kept spending it
+/// (#943 review). The project hasn't turned on generated assets, so nothing is sent or spent.
+#[test]
+fn a_key_removed_through_a_run_stops_being_spent_by_every_run_and_the_app() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Engine::shared(craft_anything_engine::testing::session(), Vec::new());
+    let worker = |name: &str| {
+        let ws = Workspace::create(dir.path(), name, "Make a game", TargetRef::None).unwrap();
+        let mut w = check_worker(&ws, false);
+        w.engine = app.for_a_run(craft_anything_engine::testing::session);
+        w.attach(&ws).unwrap();
+        (ws, w)
+    };
+    let ((_, mut a), (ws_b, mut b)) = (worker("a"), worker("b"));
+    let shown = app.session();
+    assert_eq!(shown.project.as_ref().unwrap().root, ws_b.investigation_dir(), "the app still shows the project");
+    // A run in the app's session beside them would post its questions to their inbox (#943 review).
+    assert!(shown.ext.get::<InboxDir>().is_none(), "their inbox stays theirs");
+    drop(shown);
+    // The app asks in a project of its own, as a run working in its session would.
+    let ws_c = Workspace::create(dir.path(), "c", "Make a game", TargetRef::None).unwrap();
+    app.session().ext.insert(Arc::new(InboxDir(ws_c.inbox_dir())));
+    let store = crate::KeyStore::file_only(dir.path().join("keys.toml"));
+    store.set(crate::keys::FAL_KEY, "k-1").unwrap();
+    a.load_asset_keys(&store);
+    b.load_asset_keys(&store);
+    assert!(a.assets && b.assets);
+    let call = |e: &Engine| e.call("assets_image_generate", json!({"prompt": "a crate", "save_as": "crate.png"}), CallOptions::new(Caller::Ui)).err().unwrap();
+    assert_eq!(call(&a.engine).code, ErrorCode::NoPermission, "past the key check");
+
+    store.delete(crate::keys::FAL_KEY).unwrap();
+    crate::keys::refresh_loaded(&mut a.engine.session(), &a.engine, &store);
+    // With no FAL_KEY in this test's environment the key is gone; with one, it stays set up.
+    if std::env::var_os("FAL_KEY").is_none() {
+        for (e, who) in [(&a.engine, "the run that removed it"), (&b.engine, "a run beside it"), (&app, "the app")] {
+            assert_eq!(call(e).code, ErrorCode::BadSettings, "{who} stops spending it, at its next call too");
+        }
+        assert_eq!(call(&a.engine).code, ErrorCode::BadSettings, "the app's older copy doesn't bring it back");
+    }
+
+    // A key saved in the app reaches the runs as well.
+    store.set(crate::keys::FAL_KEY, "k-2").unwrap();
+    crate::keys::refresh_loaded(&mut app.session(), &app, &store);
+    assert_eq!(call(&b.engine).code, ErrorCode::NoPermission);
+}
+
 /// #923: with OpenRouter as the builder, every asset call said "No fal.ai key" with one saved. The
 /// project hasn't turned on generated assets, so nothing is sent or spent.
 #[test]
@@ -2942,6 +3098,7 @@ pub(crate) fn check_worker(ws: &Workspace, deep: bool) -> Worker {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
         keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         kept_checks: Mutex::default(),
     }
@@ -3544,6 +3701,7 @@ fn preparing_the_builders_agent_does_not_lock_up() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     let entry = crate::BackendEntry {
         config: crate::BackendConfig {
@@ -3587,6 +3745,7 @@ fn the_run_answers_the_builders_own_check_during_its_turn() {
         usage: None,
         self_check: Some((Arc::new(SheetKind), 90.0)),
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     let mut builder = ChecksItsWork { root: ws.root.clone(), asked: None, reply: None };
     let reply = w.turn(&mut ws, &mut builder, "Build it.", true, None).unwrap();
@@ -3626,6 +3785,7 @@ fn a_stopped_build_answers_the_check_it_took() {
         usage: None,
         self_check: Some((Arc::new(SheetKind), 90.0)),
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     let asks = Inbox::new(self_check::asks_dir(&ws.root));
     let id = asks.post(craft_anything_engine::inbox::RequestKind::Question, "Check the build", "", Vec::new(), false, None).unwrap();
@@ -3635,6 +3795,104 @@ fn a_stopped_build_answers_the_check_it_took() {
     let answer = asks.wait(&id, Duration::from_secs(2), &|| false).expect("the taken check is answered");
     assert_eq!(answer.text.as_deref(), Some(self_check::STOPPED_ANSWER));
     assert!(self_check::taken_mark(&ws.root, &id).unwrap().is_file(), "the mark is left for the asker to read");
+}
+
+/// #1734 review: a tool finished while another held the session, so the investigation view waited
+/// for a free moment; a stopped check then ended the turn early. The view still gets what the
+/// finished tool wrote.
+#[test]
+fn a_turn_ended_by_a_stopped_check_still_refreshes_the_investigation() {
+    struct Wrote {
+        investigation: PathBuf,
+        polls: usize,
+    }
+    impl Conversation for Wrote {
+        fn send(&mut self, _: &str) {}
+        fn poll(&mut self) -> Vec<AgentEvent> {
+            self.polls += 1;
+            if self.polls > 1 {
+                return Vec::new();
+            }
+            let project = craft_anything_engine::project::Project::open(&self.investigation).unwrap();
+            project
+                .store_unknown(&craft_anything_evidence::Unknown::new("What does the save file hold?", "storage", craft_anything_evidence::Severity::default()))
+                .unwrap();
+            vec![AgentEvent::ToolFinished { call_id: "1".into(), tool: "core_unknown_record".into(), ok: true, summary: String::new(), evidence_id: None }]
+        }
+        fn answer_consent(&mut self, _: &str, _: bool) {}
+        fn stop(&mut self) {}
+        fn is_busy(&self) -> bool {
+            true
+        }
+    }
+
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "Arena", "Recreate this game", TargetRef::None).unwrap();
+    let mut w = check_worker(&ws, false);
+    w.self_check = Some((Arc::new(SheetKind), 90.0));
+    let project = craft_anything_engine::project::Project::create(&ws.investigation_dir(), "Arena", Default::default()).unwrap();
+    w.engine.session().open_project(project).unwrap();
+    let asks = self_check::asks_dir(&ws.root);
+    let id = Inbox::new(&asks).post(craft_anything_engine::inbox::RequestKind::Question, "Check the build", "", Vec::new(), false, None).unwrap();
+    // Another tool holds the session, as a decompile does, until the stopped check is answered:
+    // the turn's own refresh has failed by then and only the leaving one can succeed (#1746 review).
+    let (held, holding) = std::sync::mpsc::channel::<()>();
+    let engine = w.engine.clone();
+    let holder = std::thread::spawn(move || {
+        let _session = engine.session();
+        held.send(()).unwrap();
+        Inbox::new(&asks).wait(&id, Duration::from_secs(60), &|| false).expect("the stopped check is answered");
+    });
+    holding.recv().unwrap();
+    w.stop.cancel();
+    let mut agent = Wrote { investigation: ws.investigation_dir(), polls: 0 };
+    let err = w.turn_with_wait(&mut ws, &mut agent, "Carry on", true, None, |_, _| panic!("no retry")).unwrap_err();
+    holder.join().unwrap();
+    assert_eq!(err.code, ErrorCode::Cancelled, "the run still stops");
+    assert_eq!(w.engine.session().unknowns().count(), 1, "the view has what the finished tool wrote");
+}
+
+/// #1746 review: a stop isn't held up by a tool that keeps the session for longer, as a decompile
+/// waiting on Ghidra can; the view's refresh is given up.
+#[test]
+fn a_stopped_check_does_not_wait_for_a_busy_session() {
+    struct Finished;
+    impl Conversation for Finished {
+        fn send(&mut self, _: &str) {}
+        fn poll(&mut self) -> Vec<AgentEvent> {
+            vec![AgentEvent::ToolFinished { call_id: "1".into(), tool: "core_unknown_record".into(), ok: true, summary: String::new(), evidence_id: None }]
+        }
+        fn answer_consent(&mut self, _: &str, _: bool) {}
+        fn stop(&mut self) {}
+        fn is_busy(&self) -> bool {
+            true
+        }
+    }
+
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "Arena", "Recreate this game", TargetRef::None).unwrap();
+    let mut w = check_worker(&ws, false);
+    w.self_check = Some((Arc::new(SheetKind), 90.0));
+    let (held, holding) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let engine = w.engine.clone();
+    let holder = std::thread::spawn(move || {
+        let _session = engine.session();
+        held.send(()).unwrap();
+        let _ = released.recv_timeout(Duration::from_secs(60));
+    });
+    holding.recv().unwrap();
+    Inbox::new(self_check::asks_dir(&ws.root))
+        .post(craft_anything_engine::inbox::RequestKind::Question, "Check the build", "", Vec::new(), false, None)
+        .unwrap();
+    w.stop.cancel();
+    let started = Instant::now();
+    let err = w.turn_with_wait(&mut ws, &mut Finished, "Carry on", true, None, |_, _| panic!("no retry")).unwrap_err();
+    let took = started.elapsed();
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(err.code, ErrorCode::Cancelled, "the run still stops");
+    assert!(took < Duration::from_secs(20), "the stop waited {took:?} for the session");
 }
 
 /// A builder that reads one decompiled function (by its MCP name, as Claude Code calls it) and ends
@@ -3687,6 +3945,7 @@ fn decompiling_once_is_remembered_by_the_project() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     let mut builder = Decompiles { events: Vec::new() };
     w.turn(&mut ws, &mut builder, "Build it.", true, None).unwrap();
@@ -3752,6 +4011,7 @@ fn a_build_says_why_it_refused_a_tool_that_needs_consent() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     let mut builder = AsksConsent::default();
     w.turn(&mut ws, &mut builder, "Build it.", true, None).unwrap();
@@ -3955,8 +4215,22 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
         inbox: Inbox::new(ws.inbox_dir()),
         editor: None,
         notes: Arc::new(Mutex::new(vec![
-            Note { id: 1, text: "make the header blue".into(), shown: "make the header blue".into(), pictures: Vec::new(), questions: vec![asked] },
-            Note { id: 2, text: "add a footer".into(), shown: "add a footer".into(), pictures: Vec::new(), questions: Vec::new() },
+            Note {
+                id: 1,
+                text: "make the header blue".into(),
+                shown: "make the header blue".into(),
+                pictures: Vec::new(),
+                questions: vec![asked],
+                added: std::time::SystemTime::now() + Duration::from_secs(1),
+            },
+            Note {
+                id: 2,
+                text: "add a footer".into(),
+                shown: "add a footer".into(),
+                pictures: Vec::new(),
+                questions: Vec::new(),
+                added: std::time::SystemTime::now() + Duration::from_secs(1),
+            },
         ])),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
@@ -3965,6 +4239,7 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     let dir = notes::notes_dir(&ws.inbox_dir());
     notes::hand_over(&dir, 1, "make the header blue", None).unwrap();
@@ -3973,7 +4248,9 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
     std::fs::rename(dir.join("2.json"), dir.join("2.wait")).unwrap();
     assert_eq!(notes::claim(&dir), ["make the header blue"]);
     std::fs::rename(dir.join("2.wait"), dir.join("2.json")).unwrap();
+    craft_anything_engine::tools::deep::stop_for(&ws.root).unwrap();
     w.relay_read_notes(&ws);
+    assert!(!craft_anything_engine::tools::deep::stopped(&ws.root), "a note the hook took is a new request too");
     assert!(questions::untold(&ws, false).is_empty(), "the answers in a read note are told");
     let shown: Vec<String> = rx.try_iter().filter_map(|e| if let RunEvent::Note { shown, .. } = e { Some(shown) } else { None }).collect();
     assert_eq!(shown, ["make the header blue"], "it joins the feed as soon as the builder took it");
@@ -4413,6 +4690,7 @@ fn a_session_left_on_another_computer_starts_a_new_one_from_the_project() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     let first = resumed_elsewhere("THE BRIEF", &ws.manifest.last_reply, None);
     let reply = w.turn(&mut ws, &mut agent, "The person asks: make it blue", true, Some(first)).unwrap();
@@ -4469,6 +4747,7 @@ fn a_missing_session_with_nothing_to_start_from_is_said_plainly() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     let e = w
         .turn_with_wait(&mut ws, &mut agent, "Carry on.", true, None, |_, _| panic!("a missing session without a fresh start must not be retried"))
@@ -4536,6 +4815,7 @@ fn the_builders_conversation_travels_with_the_project() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
     let adapter = KeepsSessions(store.path().to_path_buf());
     // No session yet, or one this computer doesn't have: nothing to keep, nothing said.
@@ -4614,6 +4894,7 @@ fn waiting_for_another_analysis(d: &Path, limit_secs: u64) -> (Worker, std::sync
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        taken_in_turn: Vec::new(),
     };
 
     // Another process is already analysing this program: a fresh lock beside its project.
@@ -4652,6 +4933,19 @@ fn deleting_the_project_stops_its_analysis() {
     ws.delete().unwrap();
     let ended = done.recv_timeout(Duration::from_secs(20)).expect("deleting the project stopped the analysis");
     assert!(ended.is_err(), "it stopped, it didn't finish: {ended:?}");
+}
+
+/// The person stopped Ghidra for the project: a study doesn't start it again until a new request.
+#[test]
+fn a_study_leaves_ghidra_off_once_the_person_stopped_it() {
+    let d = tempfile::Builder::new().prefix("ca").tempdir().unwrap();
+    let (w, _rx, ws, program) = waiting_for_another_analysis(d.path(), 600);
+    craft_anything_engine::tools::deep::stop_for(&ws.root).unwrap();
+    assert!(w.prepare_ghidra(&program, &ws.root).is_none(), "stopped, so not started");
+    craft_anything_engine::tools::deep::resume(&ws.root).unwrap();
+    let done = w.prepare_ghidra(&program, &ws.root).expect("a new request lets it run");
+    ws.delete().unwrap();
+    assert!(done.recv_timeout(Duration::from_secs(20)).is_ok_and(|r| r.is_err()), "ends with the project");
 }
 
 /// A later run skips the study; in Deep mode it opens the program again, so the builder's tool
@@ -4695,6 +4989,7 @@ fn a_later_run_opens_the_projects_program_again_for_the_builder() {
             usage: None,
             self_check: None,
             reset_progress_after_notes: false,
+            taken_in_turn: Vec::new(),
         };
         w.reopen_target(&mut ws, app.as_ref(), true, deep).unwrap();
         assert!(w.engine.session().shared_targets().is_empty(), "a builder over SSH isn't handed this computer's targets");
@@ -4750,9 +5045,34 @@ fn a_new_build_stops_before_any_turn_when_its_stacks_program_is_missing() {
     }
 }
 
-/// #2341: detaching a finished build releases its workspace investigation and inbox without
-/// disturbing a different project opened in the meantime, and an API "Just look inside" chat
-/// detaches a still-attached build workspace before reading or writing investigation state.
+/// #1903 review: a request (a message or a note) never fails because the stop's lock is busy:
+/// Ghidra stays off, and the request goes on.
+#[test]
+fn a_busy_stop_lock_never_fails_a_request() {
+    let d = tempfile::Builder::new().prefix("ca").tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Game", "a game", TargetRef::None).unwrap();
+    craft_anything_engine::tools::deep::stop_for(&ws.root).unwrap();
+    let lock = std::fs::OpenOptions::new().read(true).write(true).open(ws.root.join(craft_anything_engine::tools::deep::STOP_LOCK)).unwrap();
+    lock.lock().unwrap();
+    super::let_ghidra_run_again(&ws.root, std::time::SystemTime::now());
+    assert!(craft_anything_engine::tools::deep::stopped(&ws.root), "couldn't take the lock, so it stays off");
+    lock.unlock().unwrap();
+    super::let_ghidra_run_again(&ws.root, std::time::SystemTime::now());
+    assert!(!craft_anything_engine::tools::deep::stopped(&ws.root));
+}
+
+/// #1903 review: the stop and its lock are the project's own files, so a builder working in the
+/// project folder can't remove the stop.
+#[test]
+fn the_stop_files_are_the_projects_own() {
+    use craft_anything_engine::workspace::OWN_NAMES;
+    assert!(OWN_NAMES.contains(&craft_anything_engine::tools::deep::STOPPED) && OWN_NAMES.contains(&craft_anything_engine::tools::deep::STOP_LOCK));
+}
+
+/// #2341: after a `for_a_run` build finishes, `Worker::detach` clears its workspace investigation
+/// from the app's shared session without disturbing a different project opened in the meantime;
+/// while a build is running, an API "Just look inside" chat on the app detaches the app's session
+/// without leaking into or interrupting the run engine's own investigation journal.
 #[test]
 fn build_detach_and_api_chat_keep_build_investigations_isolated() {
     use crate::agent::tests::{Scripted, turn};
@@ -4760,33 +5080,24 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
     use crate::model::{Block, StopReason};
 
     let dir = tempfile::tempdir().unwrap();
+    let app = Engine::shared(craft_anything_engine::Session::isolated(&dir.path().join("app-cfg")), Vec::new());
     let ws_a = Workspace::create(dir.path(), "ProjectA", "Build A", TargetRef::None).unwrap();
     let ws_b = Workspace::create(dir.path(), "ProjectB", "Build B", TargetRef::None).unwrap();
-    let worker = check_worker(&ws_a, false);
 
-    // 1. Finishing build A detaches A's investigation and inbox.
-    worker.attach(&ws_a).unwrap();
-    assert_eq!(worker.engine.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
-    assert!(worker.engine.session().ext.get::<InboxDir>().is_some());
-    worker.detach(&ws_a);
-    assert!(worker.engine.session().project.is_none(), "finished build detaches its investigation");
-    assert!(worker.engine.session().ext.get::<InboxDir>().is_none(), "finished build removes its inbox");
+    let make_run_worker = |ws: &Workspace| {
+        let mut w = check_worker(ws, false);
+        w.engine = app.for_a_run(craft_anything_engine::testing::session);
+        w
+    };
+    let worker_a = make_run_worker(&ws_a);
+    let worker_b = make_run_worker(&ws_b);
 
-    // 2. If another project is now open, detaching A must leave B untouched.
-    worker.attach(&ws_b).unwrap();
-    worker.detach(&ws_a);
-    assert_eq!(worker.engine.session().project.as_ref().map(|p| p.root.clone()), Some(ws_b.investigation_dir()));
-    assert_eq!(worker.engine.session().ext.get::<InboxDir>().map(|i| i.0.clone()), Some(ws_b.inbox_dir()));
-
-    // 3. An API chat targeting project B itself (`detach_workspace_investigation: false`, the
-    //    default used by builders and `craft-anything-cli --project <B>/investigation.cany chat`)
-    //    keeps B attached and writes its journal entry into B.
     let journal_text = |root: &std::path::Path| {
         let dir = root.join("journal");
         let Ok(entries) = std::fs::read_dir(&dir) else { return String::new() };
         entries.flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).collect::<Vec<_>>().join("\n")
     };
-    let run_turn = |detach: bool, msg: &str| {
+    let run_turn = |engine: &Arc<Engine>, detach: bool, msg: &str| {
         let seen = Arc::default();
         let mut script = Scripted { turns: std::collections::VecDeque::new(), seen: Arc::clone(&seen) };
         script.turns.push_back(turn(vec![Block::Text { text: "Looked inside.".into() }], StopReason::EndTurn));
@@ -4799,7 +5110,7 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
             context_tokens: 0,
             tools: Default::default(),
         };
-        let host = Arc::new(EngineHost(worker.engine.clone()));
+        let host = Arc::new(EngineHost(engine.clone()));
         let mut conv = ApiConversation::start(host, vec![slot], LoopConfig { detach_workspace_investigation: detach, ..LoopConfig::default() }).unwrap();
         conv.send(msg);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -4810,46 +5121,67 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     };
-    run_turn(false, "Keep in project B");
+
+    // 1. A `for_a_run` build attaches A to both its own engine and the app's shared session
+    //    (keeping InboxDir on the run engine only); finishing build A detaches both.
+    worker_a.attach(&ws_a).unwrap();
+    assert_eq!(app.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
+    assert!(app.session().ext.get::<InboxDir>().is_none(), "app session does not hold build A's inbox");
+    assert_eq!(worker_a.engine.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
+    assert!(worker_a.engine.session().ext.get::<InboxDir>().is_some());
+    worker_a.detach(&ws_a);
+    assert!(app.session().project.is_none(), "finished for_a_run build detaches A from the app session");
+    assert!(worker_a.engine.session().project.is_none(), "finished build detaches A from the run engine");
+    assert!(worker_a.engine.session().ext.get::<InboxDir>().is_none(), "finished build removes A's inbox");
+
+    // 2. If build B is now shown in the app session, detaching build A must leave B untouched.
+    worker_b.attach(&ws_b).unwrap();
+    worker_a.detach(&ws_a);
+    assert_eq!(app.session().project.as_ref().map(|p| p.root.clone()), Some(ws_b.investigation_dir()));
+    assert_eq!(worker_b.engine.session().project.as_ref().map(|p| p.root.clone()), Some(ws_b.investigation_dir()));
+    assert_eq!(worker_b.engine.session().ext.get::<InboxDir>().map(|i| i.0.clone()), Some(ws_b.inbox_dir()));
+
+    // 3. An API chat targeting project B itself (`detach_workspace_investigation: false`, the
+    //    default used by builders and `craft-anything-cli --project <B>/investigation.cany chat`)
+    //    keeps B attached and writes its journal entry into B.
+    run_turn(&app, false, "Keep in project B");
     assert_eq!(
-        worker.engine.session().project.as_ref().map(|p| p.root.clone()),
+        app.session().project.as_ref().map(|p| p.root.clone()),
         Some(ws_b.investigation_dir()),
         "chat targeting project B keeps B's investigation attached"
     );
     assert!(journal_text(&ws_b.investigation_dir()).contains("Keep in project B"), "project B chat writes into B's journal");
 
-    // 4a. While build B is still active (`Worker::attach` set B's `InboxDir`), starting a
-    //     "Just look inside" API chat must not yank B's investigation out from under the builder.
-    run_turn(true, "Question while build B runs");
-    assert_eq!(
-        worker.engine.session().project.as_ref().map(|p| p.root.clone()),
-        Some(ws_b.investigation_dir()),
-        "active build B's investigation stays attached while its build is running"
-    );
-    assert_eq!(
-        worker.engine.session().ext.get::<InboxDir>().map(|i| i.0.clone()),
-        Some(ws_b.inbox_dir()),
-        "active build B's inbox stays attached while its build is running"
-    );
-
-    // 4b. Once build B is no longer running (its `InboxDir` is detached), starting an API
-    //     "Just look inside" chat (`detach_workspace_investigation: true`) detaches any
-    //     still-open workspace investigation BEFORE journaling user_message or reading state.
-    worker.detach(&ws_b);
-    let project_b = Project::open(&ws_b.investigation_dir()).unwrap();
-    worker.engine.session().open_project(project_b).unwrap();
-    run_turn(true, "Unrelated Just look inside question");
-    assert!(worker.engine.session().project.is_none(), "API Just look inside chat detached idle build B's investigation");
+    // 4. While build A is running in its own `for_a_run` engine, starting an API "Just look inside"
+    //    chat on the app (`detach_workspace_investigation: true`) detaches A from the app session
+    //    before journaling user_message, while the running build's own engine keeps writing to A's
+    //    investigation journal uninterrupted.
+    worker_a.attach(&ws_a).unwrap();
+    assert_eq!(app.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
+    run_turn(&app, true, "Unrelated Just look inside question");
+    assert!(app.session().project.is_none(), "API Just look inside chat detached build A from the app session");
     assert!(
-        !journal_text(&ws_b.investigation_dir()).contains("Unrelated Just look inside question"),
-        "Just look inside user_message must not leak into build B's journal"
+        !journal_text(&ws_a.investigation_dir()).contains("Unrelated Just look inside question"),
+        "Just look inside user_message must not leak into build A's journal"
     );
+    assert_eq!(
+        worker_a.engine.session().project.as_ref().map(|p| p.root.clone()),
+        Some(ws_a.investigation_dir()),
+        "run engine keeps build A's investigation attached"
+    );
+    run_turn(&worker_a.engine, false, "Build A step continues");
+    assert!(
+        journal_text(&ws_a.investigation_dir()).contains("Build A step continues"),
+        "run engine continues writing into build A's journal after app chat detached"
+    );
+    worker_a.detach(&ws_a);
+    worker_b.detach(&ws_b);
 
-    // 5. End-to-end `RebuildRun::start` thread exit calls `ctx.detach(&ws)` even when the build
-    //    fails before reaching `ctx.attach(&ws)`, and `AiHub::start_detached` detaches a build
-    //    workspace for AgentCli chats.
+    // 5. End-to-end `RebuildRun::start` (which uses `hub.for_a_run`) calls `ctx.detach(&ws)` on
+    //    thread exit, clearing A from the app's session even when the run aborts before `attach`,
+    //    and `AiHub::start_detached` detaches a build workspace for AgentCli chats.
     let cfg_dir = dir.path().join("hub-cfg");
-    let engine = Arc::new(Engine::new(craft_anything_engine::Session::isolated(&cfg_dir)));
+    let engine = Engine::shared(craft_anything_engine::Session::isolated(&cfg_dir), Vec::new());
     let hub = crate::AiHub::with_stores(engine.clone(), cfg_dir.join("config.toml"), crate::KeyStore::file_only(cfg_dir.join("keys.toml")));
     hub.add_backend(
         crate::BackendConfig { name: "MissingCli".into(), kind: BackendKind::AgentCli, model: "copilot".into(), base_url: None, ssh_host: None, enabled: true },
@@ -4857,18 +5189,15 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
     )
     .unwrap();
     hub.set_command("MissingCli", Some("definitely-missing-copilot-for-detach-test")).unwrap();
-    // Pre-attach ws_a's investigation and InboxDir before `RebuildRun::start` so the post-run
-    // assertions prove `ctx.detach(&ws)` ran on thread exit even when the run aborts early
-    // (for instance, when `craft-anything-cli` is not present).
+    // Pre-attach ws_a's investigation to the app session before `RebuildRun::start` so the
+    // post-run assertion proves `ctx.detach(&ws)` ran on thread exit even when the run aborts
+    // early (for instance, when `craft-anything-cli` is not present).
     {
         let project_a =
             Project::open(&ws_a.investigation_dir()).or_else(|_| Project::create(&ws_a.investigation_dir(), "ProjectA", Purpose::default())).unwrap();
-        let mut s = engine.session();
-        s.open_project(project_a).unwrap();
-        s.ext.insert(Arc::new(InboxDir(ws_a.inbox_dir())));
+        engine.session().open_project(project_a).unwrap();
     }
     assert_eq!(engine.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
-    assert_eq!(engine.session().ext.get::<InboxDir>().map(|i| i.0.clone()), Some(ws_a.inbox_dir()));
     let run =
         RebuildRun::start(&hub, Workspace::open(&ws_a.root).unwrap(), RunOptions { backend: Some("MissingCli".into()), ..RunOptions::default() }).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4876,8 +5205,7 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
         std::thread::sleep(std::time::Duration::from_millis(15));
     }
     assert!(!run.is_running(), "missing-CLI build finished");
-    assert!(engine.session().project.is_none(), "RebuildRun::start thread exit detached ws_a's investigation");
-    assert!(engine.session().ext.get::<InboxDir>().is_none(), "RebuildRun::start thread exit detached ws_a's inbox");
+    assert!(engine.session().project.is_none(), "RebuildRun::start thread exit detached ws_a's investigation from app session");
 
     // Attach ws_a again and verify `AiHub::start_detached` routes `detach_workspace = true`
     // through `SharedConversation::new` -> `prepare`.

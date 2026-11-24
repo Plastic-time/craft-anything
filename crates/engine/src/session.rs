@@ -105,6 +105,41 @@ impl Session {
         Session { settings, config_dir: Some(dir.to_path_buf()), ..Default::default() }
     }
 
+    /// A session for one piece of work beside this one ([`crate::Engine::for_a_run`]): the same
+    /// settings, plugins and asset providers, nothing open, and this session's mode, kept for the
+    /// whole run.
+    pub fn for_a_run(&self) -> Session {
+        let mut run = Session { config_dir: self.config_dir.clone(), deep_for_run: Some(!self.clean_room()), ..Default::default() };
+        run.follow(self);
+        run
+    }
+
+    /// A session for one piece of work from the saved settings, for when the session it works
+    /// beside is busy ([`crate::Engine::for_a_run`]); `config_dir` is where they were read from.
+    pub fn for_a_run_from(settings: Settings, config_dir: Option<std::path::PathBuf>, deep_for_run: Option<bool>) -> Session {
+        Session { settings, config_dir, deep_for_run, ..Default::default() }
+    }
+
+    /// Take on what the person changes in the app while this session works: settings and what
+    /// they've allowed for this project. Asset keys are shared by the engines themselves
+    /// ([`crate::Engine::load_asset_keys`]). Not the mode: a Clean room run that took on Deep mode
+    /// would read inside the original for a build recorded as Clean room.
+    pub fn follow(&mut self, app: &Session) {
+        use craft_anything_engines::assets::AssetProviders;
+        self.settings.clone_from(&app.settings);
+        if let Some(plugins) = app.ext.get::<crate::plugins::Plugins>() {
+            self.ext.insert(plugins);
+        }
+        if let Some(providers) = app.ext.get::<AssetProviders>() {
+            self.ext.insert(providers);
+        }
+        if let (Some(mine), Some(theirs)) = (self.project.as_mut(), app.project.as_ref())
+            && mine.root == theirs.root
+        {
+            mine.meta.allowed_tools.clone_from(&theirs.meta.allowed_tools);
+        }
+    }
+
     /// Keep a project started in a folder the person picked in the project list
     /// ([`Settings::remember_project`]), saving settings when that changed them.
     pub fn remember_project(&mut self, root: &std::path::Path) -> Result<(), craft_anything_evidence::ToolError> {
@@ -297,20 +332,13 @@ impl Session {
     }
 
     /// Detach the open project when it is a build workspace's `investigation.cany` store,
-    /// leaving standalone `.cany` projects and any workspace with an active build (matching
-    /// `InboxDir` still set by `Worker::attach`) untouched (#2341). Returns `true` if detached.
+    /// leaving standalone `.cany` projects untouched (#2341). Returns `true` if detached.
     pub fn detach_workspace_investigation(&mut self) -> bool {
         let Some(root) = self.project.as_ref().map(|p| p.root.clone()) else {
             return false;
         };
         if !crate::workspace::is_workspace_investigation(&root) {
             return false;
-        }
-        if let Some(parent) = crate::workspace::normalized(&root).parent() {
-            let inbox = crate::workspace::normalized(&parent.join("inbox"));
-            if self.ext.get::<crate::inbox::InboxDir>().is_some_and(|cur| crate::workspace::normalized(&cur.0) == inbox) {
-                return false;
-            }
         }
         self.close_project();
         true
@@ -462,19 +490,10 @@ mod tests {
 
         let mut session = Session::isolated(&dir.join("cfg"));
         session.open_project(inv).unwrap();
-        session.ext.insert(Arc::new(crate::inbox::InboxDir(ws.inbox_dir())));
         let stale_inv = crate::tools::investigation_tools::Investigation { handoff: Some("Build A handoff".into()), ..Default::default() };
         crate::tools::investigation_tools::cache(&mut session, stale_inv);
 
-        // While the workspace's build is active (its InboxDir is still attached), do not detach
-        // its investigation out from under the running builder.
-        assert!(!session.detach_workspace_investigation(), "active build workspace stays attached");
-        assert_eq!(session.project.as_ref().map(|p| &p.root), Some(&ws.investigation_dir()));
-        assert!(session.ext.get::<crate::inbox::InboxDir>().is_some(), "active build InboxDir stays attached");
-
-        // Once the build is no longer active (InboxDir removed), the workspace investigation detaches.
-        session.ext.remove::<crate::inbox::InboxDir>();
-        assert!(session.detach_workspace_investigation(), "idle build workspace investigation is detached");
+        assert!(session.detach_workspace_investigation(), "build workspace investigation is detached");
         assert!(session.project.is_none());
         assert!(ledger_ids(&session).is_empty());
         assert_eq!(session.unknowns().count(), 0);

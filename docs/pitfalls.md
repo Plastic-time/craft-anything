@@ -384,6 +384,12 @@ It happened again with Vulkan on Windows (#394): starting Vulkan loaded an Intel
 (`igvk64.dll`) that crashed with `0xc0000005` on startup. Windows now starts DX12 only by default
 (which includes WARP); `WGPU_BACKEND` still allows choosing other backends.
 
+**A build script that missed a removed file.** `build.rs` joins each catalog folder, and
+`cargo::rerun-if-changed` on the folder saw a new or changed file, but not one taken away: Cargo
+compares the newest time in the folder, which a deletion doesn't change, so the joined catalog
+kept the removed file's lines. Also list every file the script read; Cargo runs it again when a
+listed file is gone. Test a generated file by adding an input and then removing it.
+
 **A shader compiler picked by a default that looks around the computer.** wgpu's DX12 `Auto`
 compiler takes a `dxcompiler.dll` it finds on the PATH; one without `dxil.dll` makes unsigned
 shaders, and on an RTX 5060 Ti the device was lost as the window opened ("Parent device is
@@ -505,6 +511,12 @@ The desktop DeepSeek Harness has a custom batch launcher, so npm-shim handling d
 it either. Send its task on stdin, with no task argument. A literal `-` is a stdin marker in newer
 Harness versions but is the task itself in older ones; omitting the task makes those older versions
 fail before a model runs. They need an update to a headless profile that supports stdin.
+
+**A stop that only one process heard.** The first Stop button for Ghidra took the project out of
+the app's in-memory list of analyses; the build then decompiled through its tool server (another
+process), which found no saved analysis and started the same hours-long one again, with no Stop
+for it. A decision several processes must honour is kept where they all look (a file in the
+project folder), checked by every path that can start the work, and cleared at one stated point.
 
 **A first analysis that waited for a lock it could never take.** Ghidra's analysis lock is created
 with `create_new` in `ghidra-cache/`, which only existed on machines that had used it before; on a
@@ -855,6 +867,14 @@ there's more below; the prompt box's one measured a few points of overflow on th
 keystroke, so a dark gradient blinked over the line being typed. Unit tests look at text, not at
 what's painted over it. When something flickers, render the frames (`Harness::render` at a
 fractional scale) and diff them, then list the shapes painted over the spot.
+
+**A copy kept in sync from one side only.** Each API-key build got an engine of its own that
+copied the app's asset keys before every tool call; a key removed through a build's own engine
+changed only that engine's copy, so the next call copied the app's older keys back and a build
+beside it never heard. And making that engine copied the app's session with a blocking lock, which
+`rebuild_start` already held, so starting a build from the tool deadlocked. State that several
+sessions must agree on lives outside them all, under a lock held for nothing else; anything that
+copies a session it may be called inside tries the lock and has a fallback.
 
 **A tool that locked the session it was called with.** `rebuild_question_ask` read the settings
 with `hub.engine.session()`, but a tool runs while its call holds the session, so the CLI waited

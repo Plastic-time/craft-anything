@@ -1140,7 +1140,8 @@ mod tests {
         assert_eq!(plain.result["stripped"], true);
 
         let mut go = elf.clone();
-        go.extend_from_slice(b"\xff Go buildinf:\x08\x02go1.22.3\0");
+        go.resize(go.len().next_multiple_of(16), 0);
+        go.extend_from_slice(&tk::formats::go_buildinfo_inline("go1.22.3", ""));
         let t = triage(&bin, &go, "g");
         assert!(!t.summary.contains("(stripped)"), "{}", t.summary);
         assert!(t.summary.contains("pclntab"), "{}", t.summary);
