@@ -193,7 +193,7 @@ fn open_archive(app: &mut CraftApp, path: String, kind: String) {
         "unreal_iostore" => ("game_iostore_list", json!({"path": path, "limit": 2000})),
         _ => ("game_unity_bundle_list", json!({"path": path, "limit": 2000})),
     };
-    let job = app.act(tool, params, tr("Read a game's files"));
+    let job = app.act_detached(tool, params, tr("Read a game's files"));
     app.state.game.start(job, GameJob::Listing);
 }
 
@@ -326,8 +326,8 @@ pub fn folder_picked(app: &mut CraftApp, folder: PathBuf) {
         pending.current = false;
     }
     app.state.game = GameFiles { folder: Some(folder), looking: true, permitted: app.state.game.permitted.clone(), jobs, ..Default::default() };
-    let archives = app.act("game_archives_list", json!({"path": path.clone()}), tr("Find a game's files"));
-    let triage = app.act("core_target_triage", json!({"path": path}), tr("Look at a game"));
+    let archives = app.act_detached("game_archives_list", json!({"path": path.clone()}), tr("Find a game's files"));
+    let triage = app.act_detached("core_target_triage", json!({"path": path}), tr("Look at a game"));
     app.state.game.start(archives, GameJob::FolderScan);
     app.state.game.start(triage, GameJob::Triage);
 }
@@ -342,12 +342,12 @@ pub fn save_to(app: &mut CraftApp, mut output: PathBuf) {
     match p.kind.as_str() {
         "unreal_pak" => {
             let params = json!({"path": p.archive, "file": p.item["path"], "output": output, "permission": true});
-            app.act("game_unreal_texture_export", params, tr("Save a picture"));
+            app.act_detached("game_unreal_texture_export", params, tr("Save a picture"));
         }
         "unity_assets" | "unity_bundle" => {
             // A bundle's rows say which serialized file inside it holds the object.
             let params = json!({"path": p.archive, "file": p.item["file"], "path_id": p.item["path_id"], "output": output});
-            app.act("game_unity_asset_export", params, tr("Save a picture"));
+            app.act_detached("game_unity_asset_export", params, tr("Save a picture"));
         }
         _ => {}
     }

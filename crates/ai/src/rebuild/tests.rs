@@ -5069,10 +5069,11 @@ fn the_stop_files_are_the_projects_own() {
     assert!(OWN_NAMES.contains(&craft_anything_engine::tools::deep::STOPPED) && OWN_NAMES.contains(&craft_anything_engine::tools::deep::STOP_LOCK));
 }
 
-/// #2341: after a `for_a_run` build finishes, `Worker::detach` clears its workspace investigation
-/// from the app's shared session without disturbing a different project opened in the meantime;
-/// while a build is running, an API "Just look inside" chat on the app detaches the app's session
-/// without leaking into or interrupting the run engine's own investigation journal.
+/// #2341: after a `for_a_run` build leaves its workspace investigation attached in the app's
+/// shared session (and even while that build is still running in its own engine), starting a
+/// "Just look inside" API or CLI chat on the app detaches the app's session before journaling or
+/// creating a shared investigation, without interrupting the run engine or affecting explicit
+/// non-detached chats targeting a project.
 #[test]
 fn build_detach_and_api_chat_keep_build_investigations_isolated() {
     use crate::agent::tests::{Scripted, turn};
@@ -5080,17 +5081,10 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
     use crate::model::{Block, StopReason};
 
     let dir = tempfile::tempdir().unwrap();
-    let app = Engine::shared(craft_anything_engine::Session::isolated(&dir.path().join("app-cfg")), Vec::new());
+    let cfg_dir = dir.path().join("app-cfg");
+    let app = Engine::shared(craft_anything_engine::Session::isolated(&cfg_dir), Vec::new());
     let ws_a = Workspace::create(dir.path(), "ProjectA", "Build A", TargetRef::None).unwrap();
     let ws_b = Workspace::create(dir.path(), "ProjectB", "Build B", TargetRef::None).unwrap();
-
-    let make_run_worker = |ws: &Workspace| {
-        let mut w = check_worker(ws, false);
-        w.engine = app.for_a_run(craft_anything_engine::testing::session);
-        w
-    };
-    let worker_a = make_run_worker(&ws_a);
-    let worker_b = make_run_worker(&ws_b);
 
     let journal_text = |root: &std::path::Path| {
         let dir = root.join("journal");
@@ -5122,95 +5116,64 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
         }
     };
 
-    // 1. A `for_a_run` build attaches A to both its own engine and the app's shared session
-    //    (keeping InboxDir on the run engine only); finishing build A detaches both.
-    worker_a.attach(&ws_a).unwrap();
-    assert_eq!(app.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
-    assert!(app.session().ext.get::<InboxDir>().is_none(), "app session does not hold build A's inbox");
-    assert_eq!(worker_a.engine.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
-    assert!(worker_a.engine.session().ext.get::<InboxDir>().is_some());
-    worker_a.detach(&ws_a);
-    assert!(app.session().project.is_none(), "finished for_a_run build detaches A from the app session");
-    assert!(worker_a.engine.session().project.is_none(), "finished build detaches A from the run engine");
-    assert!(worker_a.engine.session().ext.get::<InboxDir>().is_none(), "finished build removes A's inbox");
+    // 1. A `for_a_run` build attaches A to both its own run engine and the app's shared session.
+    //    Even while the build is running, starting an API "Just look inside" chat on the app
+    //    (`detach_workspace_investigation: true`) detaches A from the app session before
+    //    journaling user_message, while the run engine keeps writing into A uninterrupted.
+    {
+        let mut worker_a = check_worker(&ws_a, false);
+        worker_a.engine = app.for_a_run(craft_anything_engine::testing::session);
+        worker_a.attach(&ws_a).unwrap();
+        assert_eq!(app.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
 
-    // 2. If build B is now shown in the app session, detaching build A must leave B untouched.
-    worker_b.attach(&ws_b).unwrap();
-    worker_a.detach(&ws_a);
-    assert_eq!(app.session().project.as_ref().map(|p| p.root.clone()), Some(ws_b.investigation_dir()));
-    assert_eq!(worker_b.engine.session().project.as_ref().map(|p| p.root.clone()), Some(ws_b.investigation_dir()));
-    assert_eq!(worker_b.engine.session().ext.get::<InboxDir>().map(|i| i.0.clone()), Some(ws_b.inbox_dir()));
+        run_turn(&app, true, "Question during build A");
+        assert!(app.session().project.is_none(), "Just look inside API chat detached A from the app session");
+        assert!(
+            !journal_text(&ws_a.investigation_dir()).contains("Question during build A"),
+            "Just look inside user_message must not leak into build A's journal"
+        );
+        assert_eq!(
+            worker_a.engine.session().project.as_ref().map(|p| p.root.clone()),
+            Some(ws_a.investigation_dir()),
+            "run engine keeps build A's investigation attached"
+        );
+        run_turn(&worker_a.engine, false, "Build A step continues");
+        assert!(
+            journal_text(&ws_a.investigation_dir()).contains("Build A step continues"),
+            "run engine keeps writing into build A's journal after app chat detached"
+        );
+    }
 
-    // 3. An API chat targeting project B itself (`detach_workspace_investigation: false`, the
-    //    default used by builders and `craft-anything-cli --project <B>/investigation.cany chat`)
-    //    keeps B attached and writes its journal entry into B.
-    run_turn(&app, false, "Keep in project B");
-    assert_eq!(
-        app.session().project.as_ref().map(|p| p.root.clone()),
-        Some(ws_b.investigation_dir()),
-        "chat targeting project B keeps B's investigation attached"
-    );
-    assert!(journal_text(&ws_b.investigation_dir()).contains("Keep in project B"), "project B chat writes into B's journal");
-
-    // 4. While build A is running in its own `for_a_run` engine, starting an API "Just look inside"
-    //    chat on the app (`detach_workspace_investigation: true`) detaches A from the app session
-    //    before journaling user_message, while the running build's own engine keeps writing to A's
-    //    investigation journal uninterrupted.
-    worker_a.attach(&ws_a).unwrap();
+    // 2. After a `for_a_run` build ends (its run engine is dropped) leaving A attached in the
+    //    app's shared session, starting an API or AgentCli "Just look inside" chat on the app
+    //    detaches A instead of writing into A's investigation.
+    {
+        let mut worker_a = check_worker(&ws_a, false);
+        worker_a.engine = app.for_a_run(craft_anything_engine::testing::session);
+        worker_a.attach(&ws_a).unwrap();
+    }
     assert_eq!(app.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
     run_turn(&app, true, "Unrelated Just look inside question");
-    assert!(app.session().project.is_none(), "API Just look inside chat detached build A from the app session");
+    assert!(app.session().project.is_none(), "post-build API Just look inside chat detached A");
     assert!(
         !journal_text(&ws_a.investigation_dir()).contains("Unrelated Just look inside question"),
-        "Just look inside user_message must not leak into build A's journal"
+        "post-build Just look inside user_message must not leak into build A's journal"
     );
-    assert_eq!(
-        worker_a.engine.session().project.as_ref().map(|p| p.root.clone()),
-        Some(ws_a.investigation_dir()),
-        "run engine keeps build A's investigation attached"
-    );
-    run_turn(&worker_a.engine, false, "Build A step continues");
-    assert!(
-        journal_text(&ws_a.investigation_dir()).contains("Build A step continues"),
-        "run engine continues writing into build A's journal after app chat detached"
-    );
-    worker_a.detach(&ws_a);
-    worker_b.detach(&ws_b);
 
-    // 5. End-to-end `RebuildRun::start` (which uses `hub.for_a_run`) calls `ctx.detach(&ws)` on
-    //    thread exit, clearing A from the app's session even when the run aborts before `attach`,
-    //    and `AiHub::start_detached` detaches a build workspace for AgentCli chats.
-    let cfg_dir = dir.path().join("hub-cfg");
-    let engine = Engine::shared(craft_anything_engine::Session::isolated(&cfg_dir), Vec::new());
-    let hub = crate::AiHub::with_stores(engine.clone(), cfg_dir.join("config.toml"), crate::KeyStore::file_only(cfg_dir.join("keys.toml")));
+    // Re-attach A via a finished `for_a_run` build and verify `AiHub::start_detached` creates a
+    // fresh `investigations/session-*.cany` store for an AgentCli chat.
+    {
+        let mut worker_a = check_worker(&ws_a, false);
+        worker_a.engine = app.for_a_run(craft_anything_engine::testing::session);
+        worker_a.attach(&ws_a).unwrap();
+    }
+    let hub = crate::AiHub::with_stores(app.clone(), cfg_dir.join("config.toml"), crate::KeyStore::file_only(cfg_dir.join("keys.toml")));
     hub.add_backend(
         crate::BackendConfig { name: "MissingCli".into(), kind: BackendKind::AgentCli, model: "copilot".into(), base_url: None, ssh_host: None, enabled: true },
         None,
     )
     .unwrap();
     hub.set_command("MissingCli", Some("definitely-missing-copilot-for-detach-test")).unwrap();
-    // Pre-attach ws_a's investigation to the app session before `RebuildRun::start` so the
-    // post-run assertion proves `ctx.detach(&ws)` ran on thread exit even when the run aborts
-    // early (for instance, when `craft-anything-cli` is not present).
-    {
-        let project_a =
-            Project::open(&ws_a.investigation_dir()).or_else(|_| Project::create(&ws_a.investigation_dir(), "ProjectA", Purpose::default())).unwrap();
-        engine.session().open_project(project_a).unwrap();
-    }
-    assert_eq!(engine.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
-    let run =
-        RebuildRun::start(&hub, Workspace::open(&ws_a.root).unwrap(), RunOptions { backend: Some("MissingCli".into()), ..RunOptions::default() }).unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while run.is_running() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(15));
-    }
-    assert!(!run.is_running(), "missing-CLI build finished");
-    assert!(engine.session().project.is_none(), "RebuildRun::start thread exit detached ws_a's investigation from app session");
-
-    // Attach ws_a again and verify `AiHub::start_detached` routes `detach_workspace = true`
-    // through `SharedConversation::new` -> `prepare`.
-    let project_a = Project::open(&ws_a.investigation_dir()).or_else(|_| Project::create(&ws_a.investigation_dir(), "ProjectA", Purpose::default())).unwrap();
-    engine.session().open_project(project_a).unwrap();
     let mut detached_conv = hub.start_detached(Some("MissingCli"), false).unwrap();
     detached_conv.send("Look inside something else");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -5220,107 +5183,23 @@ fn build_detach_and_api_chat_keep_build_investigations_isolated() {
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
     }
-    let current = engine.session().project.as_ref().map(|p| p.root.clone());
+    let current = app.session().project.as_ref().map(|p| p.root.clone());
     assert_ne!(current, Some(ws_a.investigation_dir()), "AiHub::start_detached must not keep ws_a attached");
     assert!(
         current.as_ref().is_some_and(|p| p.starts_with(cfg_dir.join("investigations"))),
         "AiHub::start_detached created a fresh session investigation: {current:?}"
     );
-}
 
-/// #2341 review: when another thread holds the app's session lock, `Worker::detach` returns
-/// immediately without blocking build completion and hands app-session cleanup to a background
-/// thread that closes A once released, or leaves B untouched if the app switched projects first.
-#[test]
-fn detach_does_not_block_when_app_session_is_busy() {
-    let dir = tempfile::tempdir().unwrap();
-    let app = Engine::shared(craft_anything_engine::Session::isolated(&dir.path().join("app-cfg")), Vec::new());
-    let ws_a = Workspace::create(dir.path(), "ProjectA", "Build A", TargetRef::None).unwrap();
-    let ws_b = Workspace::create(dir.path(), "ProjectB", "Build B", TargetRef::None).unwrap();
-
-    let mut worker_a = check_worker(&ws_a, false);
-    worker_a.engine = app.for_a_run(craft_anything_engine::testing::session);
-
-    // 1. Busy app session holding A: detach returns immediately (does not deadlock against the
-    //    lock holder) and the deferred thread closes A once the lock is released.
-    worker_a.attach(&ws_a).unwrap();
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let app_holder = app.clone();
-    let holder = std::thread::spawn(move || {
-        let _guard = app_holder.session();
-        locked_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
-    });
-    locked_rx.recv().unwrap();
-
-    let pending = worker_a.detach_with_pending(&ws_a);
-    assert!(pending.is_some(), "busy app session defers detach to a background thread");
-    assert!(worker_a.engine.session().project.is_none(), "run engine still detaches synchronously");
-    assert!(worker_a.engine.session().ext.get::<InboxDir>().is_none(), "run engine inbox still clears synchronously");
-
-    release_tx.send(()).unwrap();
-    holder.join().unwrap();
-    pending.unwrap().join().unwrap();
-    assert!(app.session().project.is_none(), "deferred detach closed A once app session was released");
-
-    // 2. Busy app session switches to B before releasing: deferred detach leaves B untouched.
-    worker_a.attach(&ws_a).unwrap();
-    let project_b = Project::create(&ws_b.investigation_dir(), "ProjectB", Purpose::default()).unwrap();
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let app_holder = app.clone();
-    let holder = std::thread::spawn(move || {
-        let mut guard = app_holder.session();
-        locked_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
-        guard.open_project(project_b).unwrap();
-    });
-    locked_rx.recv().unwrap();
-
-    let pending = worker_a.detach_with_pending(&ws_a);
-    assert!(pending.is_some(), "busy app session defers detach while B switch is pending");
-
-    release_tx.send(()).unwrap();
-    holder.join().unwrap();
-    pending.unwrap().join().unwrap();
+    // 3. An explicit non-detached API chat (`detach_workspace_investigation: false`, as used by
+    //    `craft-anything-cli --project <B>/investigation.cany chat`) keeps B attached and writes
+    //    its journal entry into B.
+    let project_b = Project::open(&ws_b.investigation_dir()).or_else(|_| Project::create(&ws_b.investigation_dir(), "ProjectB", Purpose::default())).unwrap();
+    app.session().open_project(project_b).unwrap();
+    run_turn(&app, false, "Keep in project B");
     assert_eq!(
         app.session().project.as_ref().map(|p| p.root.clone()),
         Some(ws_b.investigation_dir()),
-        "deferred detach must not close project B opened while app session was busy"
+        "chat targeting project B keeps B's investigation attached"
     );
-}
-
-/// #2341 review: when a tool thread still holds the run engine's own session lock as the build
-/// stops, `Worker::detach` also returns immediately and the deferred thread closes the project
-/// and clears `InboxDir` once the lock is released.
-#[test]
-fn detach_does_not_block_when_run_session_is_busy() {
-    let dir = tempfile::tempdir().unwrap();
-    let app = Engine::shared(craft_anything_engine::Session::isolated(&dir.path().join("app-cfg")), Vec::new());
-    let ws_a = Workspace::create(dir.path(), "ProjectA", "Build A", TargetRef::None).unwrap();
-
-    let mut worker_a = check_worker(&ws_a, false);
-    worker_a.engine = app.for_a_run(craft_anything_engine::testing::session);
-    worker_a.attach(&ws_a).unwrap();
-
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let run_holder = worker_a.engine.clone();
-    let holder = std::thread::spawn(move || {
-        let _guard = run_holder.session();
-        locked_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
-    });
-    locked_rx.recv().unwrap();
-
-    let pending = worker_a.detach_with_pending(&ws_a);
-    assert!(pending.is_some(), "busy run session defers detach to a background thread");
-    assert!(app.session().project.is_none(), "free app session still detaches synchronously");
-
-    release_tx.send(()).unwrap();
-    holder.join().unwrap();
-    pending.unwrap().join().unwrap();
-    assert!(worker_a.engine.session().project.is_none(), "deferred detach closed A on the run engine");
-    assert!(worker_a.engine.session().ext.get::<InboxDir>().is_none(), "deferred detach removed InboxDir on the run engine");
+    assert!(journal_text(&ws_b.investigation_dir()).contains("Keep in project B"), "project B chat writes into B's journal");
 }

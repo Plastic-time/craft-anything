@@ -1056,9 +1056,23 @@ impl CraftApp {
     /// as `Done::Acted` and is shown by `acted`. A click is the person's consent. The job's id lets
     /// a screen ignore an answer that a newer request has replaced.
     pub fn act(&mut self, tool: &'static str, params: Value, title: String) -> u64 {
+        self.act_with(tool, params, title, false)
+    }
+
+    /// As [`CraftApp::act`], but first detaches any build workspace's `investigation.cany` from
+    /// the shared session so "Just look inside" actions (such as Game files) never write evidence
+    /// or journal entries into a previously built project (#2341).
+    pub(crate) fn act_detached(&mut self, tool: &'static str, params: Value, title: String) -> u64 {
+        self.act_with(tool, params, title, true)
+    }
+
+    pub(crate) fn act_with(&mut self, tool: &'static str, params: Value, title: String, detach_workspace: bool) -> u64 {
         let engine = self.engine.clone();
         let scope = params.clone();
         self.jobs.spawn(title, false, move |j| {
+            if detach_workspace {
+                engine.session().detach_workspace_investigation();
+            }
             let progress = j.reporter();
             let opts = CallOptions::new(Caller::Ui).with_consent(Consent::Granted).with_cancel(j.cancel.clone()).with_progress(&progress);
             let result = engine.call(tool, params, opts).map(|o| o.to_json().get("result").cloned().unwrap_or(Value::Null));
@@ -2459,22 +2473,19 @@ mod backend_snapshot_tests {
             let p = Project::open(&inv_a).or_else(|_| Project::create(&inv_a, "ProjectA", Purpose::default())).unwrap();
             engine.session().open_project(p).unwrap();
         };
-        let drain_job = |app: &mut CraftApp, target: u64| {
+        let drain_jobs = |app: &mut CraftApp, targets: &[u64]| {
+            let mut pending: std::collections::HashSet<u64> = targets.iter().copied().collect();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while std::time::Instant::now() < deadline {
-                let mut hit = false;
+            while !pending.is_empty() && std::time::Instant::now() < deadline {
                 for f in app.jobs.poll() {
-                    if f.job == target {
-                        hit = true;
-                    }
+                    pending.remove(&f.job);
                     app.handle_done(f);
                 }
-                if hit {
-                    return;
+                if !pending.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            panic!("background job {target} did not finish");
+            assert!(pending.is_empty(), "background jobs did not finish: {pending:?}");
         };
 
         let mut app = demo::app(engine.clone());
@@ -2485,14 +2496,37 @@ mod backend_snapshot_tests {
         std::fs::write(&file_b, b"unrelated target B").unwrap();
         app.open_path(file_b);
         let open_job = app.jobs.list.last().expect("open_path spawned a job").id;
-        drain_job(&mut app, open_job);
+        drain_jobs(&mut app, &[open_job]);
         assert!(engine.session().project.is_none(), "open_path detached build workspace A");
 
         // 2. `run_tool("web_site_open", ..., Route::Chat)` detaches build workspace A.
         attach();
         app.run_tool("web_site_open", json!({"url": "not-a-valid-url"}), Route::Chat { intro: String::new(), cta: false }, Consent::NotAsked);
         let web_job = *app.chat_jobs.last().expect("web_site_open spawned a chat job");
-        drain_job(&mut app, web_job);
+        drain_jobs(&mut app, &[web_job]);
         assert!(engine.session().project.is_none(), "web_site_open chat entry detached build workspace A");
+
+        // 3. "A game's files" (`game_files::folder_picked`) detaches build workspace A before
+        //    running `game_archives_list` and `core_target_triage`, so neither records evidence or
+        //    journal entries into project A.
+        attach();
+        let game_dir = dir.path().join("unrelated-game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        game_files::folder_picked(&mut app, game_dir);
+        let game_jobs: Vec<u64> = app.state.game.jobs.keys().copied().collect();
+        assert_eq!(game_jobs.len(), 2, "folder_picked spawned archive scan and triage jobs");
+        drain_jobs(&mut app, &game_jobs);
+        assert!(engine.session().project.is_none(), "game_files::folder_picked detached build workspace A");
+        let journal = std::fs::read_dir(inv_a.join("journal"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !journal.contains("game_archives_list") && !journal.contains("core_target_triage"),
+            "GameFiles tools must not leak into build project A's journal: {journal}"
+        );
     }
 }
